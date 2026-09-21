@@ -22,10 +22,14 @@ function Set-DFStateContext {
     param(
         [string] $StatePath,
 
-        [string] $ThawSpaceLabelPattern = 'ThawSpace*'
+        [string] $ThawSpaceLabelPattern = 'ThawSpace*',
+
+        [string] $ExpectedVolumeSerial
     )
 
-    $state = Resolve-DFStatePath -StatePath $StatePath -ThawSpaceLabelPattern $ThawSpaceLabelPattern
+    $state = Resolve-DFStatePath -StatePath $StatePath `
+                                 -ThawSpaceLabelPattern $ThawSpaceLabelPattern `
+                                 -ExpectedVolumeSerial $ExpectedVolumeSerial
     $script:DFState = $state
 
     try {

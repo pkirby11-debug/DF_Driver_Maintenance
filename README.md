@@ -170,6 +170,7 @@ without parsing the report:
 | `DF002` | Warning | Freeze state could not be determined |
 | `DF003` | Critical | Deep Freeze client not detected |
 | `DF004` | Critical | State path is not persistent — this report dies on the next Frozen reboot |
+| `DF005` | Critical | State volume serial does not match the one pinned at setup — possible substitution |
 | `WU001` | Warning | Reboot pending while Frozen — the work will be discarded, not applied |
 | `WU002` | Critical | Critical/important updates pending |
 | `WU003` | Info | Non-critical updates pending |

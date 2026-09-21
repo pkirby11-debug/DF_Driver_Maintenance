@@ -38,7 +38,11 @@ function Initialize-DFMaintenance {
 
         # Explicit path to Invoke-DFComplianceScan.ps1. Needed whenever the module is
         # deployed somewhere other than an intact copy of the repository tree.
-        [string] $ScanScriptPath
+        [string] $ScanScriptPath,
+
+        # Register the task even when the scan script sits outside an administrator-
+        # controlled directory. Only for lab testing -- see the refusal message.
+        [switch] $AllowUntrustedScriptPath
     )
 
     $state = Set-DFStateContext -StatePath $StatePath
@@ -77,6 +81,9 @@ otherwise every scan result is discarded on the next reboot.
             StatePath             = $state.Path
             ThawSpaceLabelPattern = 'ThawSpace*'
             DFCPath               = (Get-DFCPath)
+            # Pinned so a later run can detect a volume matched only by label being
+            # substituted for the one set up here.
+            StateVolumeSerial     = $state.VolumeSerial
             LogRetentionDays      = 90
             DriverAgeWarningDays  = 1095
             TrackedSoftware       = @()
@@ -100,6 +107,33 @@ otherwise every scan result is discarded on the next reboot.
 
         # Registering a task that points at a non-existent script produces a task that
         # fails silently every night while this function reports TaskRegistered = $true.
+        # The task runs powershell.exe -ExecutionPolicy Bypass as SYSTEM against this
+        # path. If a kiosk user can write to its directory they can edit the script and
+        # get SYSTEM -- the same escalation shape as an unvalidated DFCPath. Refuse by
+        # default rather than registering a SYSTEM task pointing at user-writable code.
+        $scriptDir = [System.IO.Path]::GetDirectoryName($scanScript)
+        if ((Test-Path -LiteralPath $scanScript) -and
+            -not (Test-DFTrustedDirectory -Path $scriptDir) -and
+            -not $AllowUntrustedScriptPath) {
+            Write-Warning @"
+Scan script '$scanScript' is not in an administrator-controlled directory.
+The scheduled task would run it as SYSTEM with -ExecutionPolicy Bypass, so anyone who can
+write there gains SYSTEM on this machine. Task NOT registered.
+Copy the module and scripts\ to %ProgramFiles%\DFMaintenance and pass -ScanScriptPath,
+or re-run with -AllowUntrustedScriptPath if this is a lab machine.
+"@
+            return [PSCustomObject]@{
+                StatePath        = $state.Path
+                StateSource      = $state.Source
+                IsPersistent     = $state.IsPersistent
+                ConfigPath       = $configPath
+                FreezeState      = $freeze.State
+                TaskRegistered   = $false
+                ScanScriptPath   = $scanScript
+                DirectorySecured = $secured
+            }
+        }
+
         if (-not (Test-Path -LiteralPath $scanScript)) {
             Write-Warning "Scan script not found at '$scanScript'. Task NOT registered. Pass -ScanScriptPath, or deploy scripts\Invoke-DFComplianceScan.ps1 alongside the module."
             return [PSCustomObject]@{

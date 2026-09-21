@@ -1,3 +1,43 @@
+function Test-DFTrustedDirectory {
+    <#
+    .SYNOPSIS
+        Returns $true only for a directory under an administrator-controlled root.
+
+    .DESCRIPTION
+        Used to gate what a SYSTEM scheduled task is allowed to execute. The task runs
+        powershell.exe with -ExecutionPolicy Bypass as SYSTEM, so a scan script sitting in
+        a user-writable directory (a repo clone under a user profile, C:\Temp, a share)
+        is the same privilege-escalation shape as an unvalidated DFCPath: a kiosk user
+        edits the script, and it runs as SYSTEM that night.
+
+        %ProgramFiles%, %ProgramFiles(x86)% and %SystemRoot% are writable only by
+        administrators on a correctly configured Windows install, which is the property
+        being relied on.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string] $Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    try { $full = [System.IO.Path]::GetFullPath($Path) } catch { return $false }
+
+    $allowedRoots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:SystemRoot) |
+        Where-Object { $_ }
+
+    foreach ($root in $allowedRoots) {
+        try { $rootFull = [System.IO.Path]::GetFullPath($root).TrimEnd('\') } catch { continue }
+        if ($full.StartsWith($rootFull + [System.IO.Path]::DirectorySeparatorChar,
+                             [StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Test-DFTrustedExecutablePath {
     <#
     .SYNOPSIS

@@ -20,6 +20,7 @@ function Get-DFConfig {
         StatePath             = $null
         ThawSpaceLabelPattern = 'ThawSpace*'
         DFCPath               = $null
+        StateVolumeSerial     = $null
         LogRetentionDays      = 90
         DriverAgeWarningDays  = 1095   # ~3 years; a driver older than this is worth a look
         TrackedSoftware       = @()    # empty = report everything found

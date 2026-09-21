@@ -49,7 +49,8 @@ function Get-DFComplianceSnapshot {
     # same volume as its report rather than on the frozen volume.
     $effectiveStatePath = if ($StatePath) { $StatePath } else { $config.StatePath }
     $state = Set-DFStateContext -StatePath $effectiveStatePath `
-                                -ThawSpaceLabelPattern $config.ThawSpaceLabelPattern
+                                -ThawSpaceLabelPattern $config.ThawSpaceLabelPattern `
+                                -ExpectedVolumeSerial $config.StateVolumeSerial
 
     Write-DFLog -Component 'Compliance' -Message 'Starting compliance snapshot.'
 
@@ -94,6 +95,12 @@ function Get-DFComplianceSnapshot {
     # destroyed on the next Frozen reboot -- nightly, forever, with nothing to show for it.
     if (-not $state.IsPersistent) {
         Add-Finding 'Critical' 'DF004' "State path '$($state.Path)' is not persistent ($($state.Source)); this report will be discarded on the next Frozen reboot."
+    }
+    # The state volume holds the config that steers a SYSTEM-executed path, so a volume
+    # matched only by label that is not the one pinned at setup is a substitution, not a
+    # detail.
+    if (-not $state.VolumeTrusted) {
+        Add-Finding 'Critical' 'DF005' "State volume serial '$($state.VolumeSerial)' does not match the serial pinned at setup. The state volume may have been substituted."
     }
 
     # --- Reboot loop --------------------------------------------------------
@@ -170,6 +177,8 @@ function Get-DFComplianceSnapshot {
         StatePath      = $state.Path
         StateSource    = $state.Source
         IsPersistent   = $state.IsPersistent
+        VolumeSerial   = $state.VolumeSerial
+        VolumeTrusted  = $state.VolumeTrusted
         Findings       = $findings.ToArray()
         FreezeState    = $freeze
         WindowsUpdate  = $updates
