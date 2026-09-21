@@ -20,14 +20,20 @@ function Get-DFCPath {
         return (Resolve-Path -LiteralPath $ConfiguredPath).Path
     }
 
-    $candidates = @(
-        (Join-Path $env:ProgramFiles          'Faronics\Deep Freeze\DFC.exe')
-        (Join-Path $env:ProgramFiles          'Faronics\Deep Freeze Enterprise\DFC.exe')
-        (Join-Path ${env:ProgramFiles(x86)}   'Faronics\Deep Freeze\DFC.exe')
-        (Join-Path ${env:ProgramFiles(x86)}   'Faronics\Deep Freeze Enterprise\DFC.exe')
-        (Join-Path $env:SystemRoot            'System32\DFC.exe')
-        (Join-Path $env:SystemRoot            'SysWOW64\DFC.exe')
-    ) | Where-Object { $_ }
+    # Join-Path throws a terminating parameter-binding error when -Path is null, and
+    # under the module's $ErrorActionPreference='Stop' that kills the entire scan.
+    # ${env:ProgramFiles(x86)} is null on a 32-bit OS, so the roots must be filtered
+    # BEFORE they are joined -- filtering the joined results afterwards is too late.
+    $roots = @(
+        @{ Base = $env:ProgramFiles        ; Leaves = @('Faronics\Deep Freeze\DFC.exe', 'Faronics\Deep Freeze Enterprise\DFC.exe') }
+        @{ Base = ${env:ProgramFiles(x86)} ; Leaves = @('Faronics\Deep Freeze\DFC.exe', 'Faronics\Deep Freeze Enterprise\DFC.exe') }
+        @{ Base = $env:SystemRoot          ; Leaves = @('System32\DFC.exe', 'SysWOW64\DFC.exe') }
+    )
+
+    $candidates = foreach ($root in $roots) {
+        if (-not $root.Base) { continue }
+        foreach ($leaf in $root.Leaves) { Join-Path $root.Base $leaf }
+    }
 
     foreach ($candidate in $candidates) {
         if (Test-Path -LiteralPath $candidate) {

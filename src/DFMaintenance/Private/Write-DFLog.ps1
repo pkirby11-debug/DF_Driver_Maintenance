@@ -47,7 +47,9 @@ function Write-DFLog {
 
     try {
         $line = ($record | ConvertTo-Json -Depth 6 -Compress)
-        Add-Content -Path $LogPath -Value $line -Encoding UTF8 -ErrorAction Stop
+        # Add-Content -Encoding UTF8 prefixes a BOM on Windows PowerShell 5.1, which
+        # corrupts the first line of each monthly log for any non-PowerShell JSONL reader.
+        Write-DFTextFile -Path $LogPath -Content ($line + [Environment]::NewLine) -Append
     } catch {
         Write-Warning "Log write failed ($LogPath): $($_.Exception.Message)"
     }

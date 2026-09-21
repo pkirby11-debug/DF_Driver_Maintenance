@@ -43,12 +43,17 @@ try {
     $modulePath = [System.IO.Path]::GetFullPath($modulePath)
     Import-Module $modulePath -Force -ErrorAction Stop
 
-    $snapshot = Get-DFComplianceSnapshot -SkipOnlineSearch:$SkipOnlineSearch -ConfigPath $ConfigPath
-    $report   = $snapshot | Export-DFComplianceReport -StatePath $StatePath -IncludeHtml:$IncludeHtml
+    $snapshot = Get-DFComplianceSnapshot -SkipOnlineSearch:$SkipOnlineSearch `
+                                        -ConfigPath $ConfigPath -StatePath $StatePath
+    $report   = $snapshot | Export-DFComplianceReport -StatePath $StatePath `
+                                                     -ConfigPath $ConfigPath -IncludeHtml:$IncludeHtml
 
     Write-Output "Status : $($snapshot.OverallStatus)"
-    Write-Output "Report : $($report.JsonPath)"
+    Write-Output "Report : $(if ($report.JsonPath) { $report.JsonPath } else { '<write failed>' })"
     Write-Output "Durable: $($report.IsPersistent)"
+    if ($report.WriteError) {
+        Write-Output "Write  : FAILED - $($report.WriteError)"
+    }
 
     foreach ($finding in $snapshot.Findings) {
         Write-Output ("  [{0}] {1} {2}" -f $finding.Severity, $finding.Code, $finding.Message)

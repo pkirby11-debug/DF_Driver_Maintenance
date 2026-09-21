@@ -58,9 +58,36 @@ function Get-DFFreezeState {
     $result.Method = 'DFC.exe /ISFROZEN'
 
     try {
-        # Output is discarded deliberately; the exit code carries the answer.
-        $null = & $dfc '/ISFROZEN' 2>&1
-        $exitCode = $LASTEXITCODE
+        # The exit code carries the answer, so it MUST be read even when DFC.exe
+        # chatters on stderr.
+        #
+        # On Windows PowerShell 5.1, merging a native command's stderr into the success
+        # stream with 2>&1 wraps each stderr line in a NativeCommandError record. This
+        # module sets $ErrorActionPreference = 'Stop' at module scope, and module
+        # functions inherit the module scope's preference variables -- so that record is
+        # thrown as a TERMINATING error before $LASTEXITCODE is ever read. PowerShell 7.x
+        # does not do this (PSNotApplyErrorActionToStderr), which is why the bug is
+        # invisible when authoring off-Windows.
+        #
+        # Consequence if this regresses: a genuinely THAWED public-facing machine reports
+        # State='Unknown' -> DF002 Warning instead of DF001 Critical. Do not reintroduce
+        # a bare 2>&1 here.
+        $stderrText = $null
+        $previousEap = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $stderrText = (& $dfc '/ISFROZEN' 2>&1 | Out-String).Trim()
+            $exitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousEap
+        }
+
+        if ($null -eq $exitCode) {
+            $result.State  = 'Unknown'
+            $result.Detail = 'DFC.exe produced no exit code.'
+            Write-DFLog -Level 'Error' -Component 'FreezeState' -Message $result.Detail
+            return [PSCustomObject]$result
+        }
 
         switch ($exitCode) {
             1 { $result.State = 'Frozen'; $result.IsFrozen = $true }
@@ -68,6 +95,7 @@ function Get-DFFreezeState {
             default {
                 $result.State  = 'Unknown'
                 $result.Detail = "DFC.exe returned unexpected exit code $exitCode"
+                if ($stderrText) { $result.Detail += " (output: $stderrText)" }
                 Write-DFLog -Level 'Warning' -Component 'FreezeState' `
                     -Message "Unexpected DFC.exe exit code: $exitCode"
             }

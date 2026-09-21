@@ -71,6 +71,8 @@ Work through this on a single test machine before any wider deployment.
 ### 2. State persistence — the foundation
 
 - [ ] `Resolve-DFStatePath` finds a ThawSpace volume and reports `IsPersistent = $true`
+- [ ] With no ThawSpace, a scan produces finding **`DF004` at Critical** (not merely a
+      warning nobody sees) and exits 2
 - [ ] With no ThawSpace, it falls back to ProgramData and reports `IsPersistent = $false`
 - [ ] **A report written to ThawSpace survives a Frozen reboot.** Write a report,
       reboot Frozen, confirm the file is still there. If this fails, nothing else
@@ -84,6 +86,11 @@ Work through this on a single test machine before any wider deployment.
       install location varies by Deep Freeze version)
 - [ ] With DFC.exe absent/renamed, `Get-DFFreezeState` returns `Unknown`, not a guess
 - [ ] Thawed machine produces finding `DF001` at Critical
+- [ ] **DFC.exe stderr does not break the read.** If your DFC.exe writes any banner or
+      notice to stderr, confirm `Get-DFFreezeState` still returns Frozen/Thawed rather
+      than `Unknown`. On 5.1, native stderr under `$ErrorActionPreference='Stop'` becomes
+      a terminating error; the code neutralises the preference around the call
+      specifically to prevent a Thawed machine being downgraded to `DF002` Warning.
 
 ### 4. Windows Update
 
@@ -100,6 +107,10 @@ Work through this on a single test machine before any wider deployment.
 - [ ] `Get-DFDriverInventory` returns sensible driver counts and ages
 - [ ] `ProblemDevices` correctly lists a device in error state (test by disabling one)
 - [ ] `Get-DFSoftwareInventory` finds your tracked apps; tune `TrackedSoftware`
+- [ ] `UserHivesRead` is reported. Under SYSTEM at 03:00 with nobody logged on this will
+      usually be 0 — that is expected, not a bug. Machine-wide installs are still complete.
+      If you need per-user coverage, run a scan while a profile is loaded and confirm the
+      count rises.
 - [ ] Confirm the inventory does **not** trigger MSI reconfigure dialogs
       (the reason `Win32_Product` is avoided — verify this holds in practice)
 
@@ -110,6 +121,17 @@ Work through this on a single test machine before any wider deployment.
 - [ ] HTML renders correctly **with no network connectivity**
 - [ ] Old reports are pruned past `LogRetentionDays`; ThawSpace does not fill up
       over months of unattended running
+- [ ] **No byte-order mark.** Confirm the first byte of `latest.json` is `{` (0x7B), not
+      0xEF. This is the single most likely 5.1-vs-7.x divergence in the codebase:
+      ```powershell
+      ([System.IO.File]::ReadAllBytes('T:\DFMaintenance\reports\latest.json'))[0..2]
+      # expect 123 34 ... (i.e. '{'), NOT 239 187 191
+      ```
+      Then confirm a non-PowerShell parser can read it, since that is the actual consumer.
+- [ ] Logs land under the **same** state path as the reports (not `C:\ProgramData`) when
+      `-StatePath` is passed or `StatePath` is set in config
+- [ ] A write failure still reports: fill the volume, run a scan, confirm the findings are
+      printed and `WriteError` is set rather than the scan dying with exit 3
 
 ### 7. Scheduled execution
 

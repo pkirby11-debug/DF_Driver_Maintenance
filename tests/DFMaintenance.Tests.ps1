@@ -17,6 +17,9 @@ BeforeAll {
     . (Join-Path $script:ModuleRoot 'Private\Get-DFConfig.ps1')
     . (Join-Path $script:ModuleRoot 'Private\ConvertTo-DFHtmlReport.ps1')
     . (Join-Path $script:ModuleRoot 'Private\Invoke-DFRetention.ps1')
+    . (Join-Path $script:ModuleRoot 'Private\Write-DFTextFile.ps1')
+    . (Join-Path $script:ModuleRoot 'Private\Set-DFStateContext.ps1')
+    . (Join-Path $script:ModuleRoot 'Private\Get-DFCPath.ps1')
 
     $script:TestRoot = Join-Path ([System.IO.Path]::GetTempPath()) "dfmtest-$([guid]::NewGuid().ToString('N'))"
     New-Item -Path $script:TestRoot -ItemType Directory -Force | Out-Null
@@ -183,6 +186,66 @@ Describe 'Invoke-DFRetention' {
     It 'does not throw on a missing state directory' {
         { Invoke-DFRetention -StatePath (Join-Path $script:TestRoot 'nope') -RetentionDays 90 } |
             Should -Not -Throw
+    }
+}
+
+Describe 'Write-DFTextFile' {
+    # Set-Content -Encoding UTF8 means UTF-8 WITH BOM on Windows PowerShell 5.1 and
+    # WITHOUT on 7.x. latest.json is read by a non-PowerShell collector, so a BOM makes
+    # the system of record unparseable. These tests must pass on BOTH editions.
+    It 'writes no byte-order mark' {
+        $p = Join-Path $script:TestRoot 'nobom.json'
+        Write-DFTextFile -Path $p -Content '{"a":1}'
+        $bytes = [System.IO.File]::ReadAllBytes($p)
+        $bytes[0] | Should -Be 0x7B   # '{'
+        @($bytes[0], $bytes[1], $bytes[2]) -join ',' | Should -Not -Be '239,187,191'
+    }
+
+    It 'produces JSON a strict parser can read back' {
+        $p = Join-Path $script:TestRoot 'roundtrip.json'
+        Write-DFTextFile -Path $p -Content ([PSCustomObject]@{ status = 'Critical' } | ConvertTo-Json)
+        (Get-Content -LiteralPath $p -Raw | ConvertFrom-Json).status | Should -Be 'Critical'
+    }
+
+    It 'appends without a BOM on the first line' {
+        $p = Join-Path $script:TestRoot 'append.jsonl'
+        Write-DFTextFile -Path $p -Content ('{"n":1}' + [Environment]::NewLine) -Append
+        Write-DFTextFile -Path $p -Content ('{"n":2}' + [Environment]::NewLine) -Append
+        @(Get-Content -LiteralPath $p).Count | Should -Be 2
+        ([System.IO.File]::ReadAllBytes($p))[0] | Should -Be 0x7B
+    }
+}
+
+Describe 'Set-DFStateContext' {
+    It 'points the log target at the supplied state path' {
+        $sp = Join-Path $script:TestRoot 'ctx1'
+        $state = Set-DFStateContext -StatePath $sp
+        $state.Path | Should -Be $sp
+        Test-Path (Join-Path $sp 'logs') | Should -BeTrue
+    }
+
+    It 'moves the log target when the state path changes' {
+        # The regression this guards: the log path used to be resolved once at import,
+        # so -StatePath moved the reports to ThawSpace but left the logs on the frozen
+        # volume, where they were destroyed on the next reboot.
+        $a = Join-Path $script:TestRoot 'ctxA'
+        $b = Join-Path $script:TestRoot 'ctxB'
+        Set-DFStateContext -StatePath $a | Out-Null
+        Set-DFStateContext -StatePath $b | Out-Null
+        $script:DFLogPath | Should -BeLike "*$([System.IO.Path]::GetFileName($b))*"
+    }
+}
+
+Describe 'Get-DFCPath' {
+    It 'does not throw when a Program Files root is null' {
+        # ${env:ProgramFiles(x86)} is null on a 32-bit OS. Join-Path throws a terminating
+        # binding error on a null -Path, and under the module's EAP=Stop that killed the
+        # entire scan before any report was written.
+        { Get-DFCPath } | Should -Not -Throw
+    }
+
+    It 'does not throw on a non-existent configured path' {
+        { Get-DFCPath -ConfiguredPath (Join-Path $script:TestRoot 'no\such\DFC.exe') } | Should -Not -Throw
     }
 }
 

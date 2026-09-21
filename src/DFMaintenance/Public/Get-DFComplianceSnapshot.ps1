@@ -36,6 +36,8 @@ function Get-DFComplianceSnapshot {
 
         [string] $ConfigPath,
 
+        [string] $StatePath,
+
         # Consider maintenance overdue if nothing installed successfully in this many days.
         [ValidateRange(1, 365)]
         [int] $MaintenanceOverdueDays = 45
@@ -43,11 +45,25 @@ function Get-DFComplianceSnapshot {
 
     $config = Get-DFConfig -ConfigPath $ConfigPath
 
+    # Resolve the state path the same way Export does, so logs from this scan land on the
+    # same volume as its report rather than on the frozen volume.
+    $effectiveStatePath = if ($StatePath) { $StatePath } else { $config.StatePath }
+    $state = Set-DFStateContext -StatePath $effectiveStatePath `
+                                -ThawSpaceLabelPattern $config.ThawSpaceLabelPattern
+
     Write-DFLog -Component 'Compliance' -Message 'Starting compliance snapshot.'
+
+    # -StaleAfterDays carries [ValidateRange(0,10000)]; binding an out-of-range config
+    # value would throw and abort the whole scan. Clamp first.
+    $driverAgeDays = 1095
+    if ($config.DriverAgeWarningDays -is [int] -and
+        $config.DriverAgeWarningDays -ge 0 -and $config.DriverAgeWarningDays -le 10000) {
+        $driverAgeDays = $config.DriverAgeWarningDays
+    }
 
     $freeze   = Get-DFFreezeState -DFCPath $config.DFCPath
     $updates  = Get-DFWindowsUpdateStatus -SkipOnlineSearch:$SkipOnlineSearch
-    $drivers  = Get-DFDriverInventory -StaleAfterDays $config.DriverAgeWarningDays
+    $drivers  = Get-DFDriverInventory -StaleAfterDays $driverAgeDays
     $software = Get-DFSoftwareInventory -TrackedSoftware $config.TrackedSoftware
 
     $findings = [System.Collections.Generic.List[PSCustomObject]]::new()
@@ -70,6 +86,14 @@ function Get-DFComplianceSnapshot {
     }
     if (-not $freeze.DeepFreezeInstalled) {
         Add-Finding 'Critical' 'DF003' 'Deep Freeze client not detected on this machine.'
+    }
+
+    # --- State durability ---------------------------------------------------
+    # A Write-Warning is invisible under Task Scheduler as SYSTEM, so a machine with no
+    # ThawSpace would otherwise scan clean, report Healthy, and have the whole report
+    # destroyed on the next Frozen reboot -- nightly, forever, with nothing to show for it.
+    if (-not $state.IsPersistent) {
+        Add-Finding 'Critical' 'DF004' "State path '$($state.Path)' is not persistent ($($state.Source)); this report will be discarded on the next Frozen reboot."
     }
 
     # --- Reboot loop --------------------------------------------------------
@@ -109,7 +133,16 @@ function Get-DFComplianceSnapshot {
         Add-Finding 'Warning' 'DRV001' "$($drivers.ProblemCount) device(s) in an error state: $(($drivers.ProblemDevices | Select-Object -First 3 -ExpandProperty Name) -join '; ')"
     }
     if ($drivers.StaleCount -gt 0) {
-        Add-Finding 'Info' 'DRV002' "$($drivers.StaleCount) third-party driver(s) older than $($config.DriverAgeWarningDays) days."
+        Add-Finding 'Info' 'DRV002' "$($drivers.StaleCount) third-party driver(s) older than $driverAgeDays days."
+    }
+    # Both inventories swallow their exceptions into an Error property and leave every
+    # count at 0. Without these checks a machine whose entire driver inventory failed --
+    # the thing this project exists to collect -- reports Healthy with exit code 0.
+    if ($drivers.Error) {
+        Add-Finding 'Warning' 'DRV003' "Driver inventory failed: $($drivers.Error)"
+    }
+    if ($software.Error) {
+        Add-Finding 'Warning' 'SW001' "Software inventory failed: $($software.Error)"
     }
 
     $severityRank = @{ 'Critical' = 3; 'Warning' = 2; 'Info' = 1 }
@@ -127,8 +160,11 @@ function Get-DFComplianceSnapshot {
     return [PSCustomObject]@{
         Computer       = $env:COMPUTERNAME
         Timestamp      = (Get-Date).ToString('o')
-        SchemaVersion  = 1
+        SchemaVersion  = 2
         OverallStatus  = $overall
+        StatePath      = $state.Path
+        StateSource    = $state.Source
+        IsPersistent   = $state.IsPersistent
         Findings       = $findings.ToArray()
         FreezeState    = $freeze
         WindowsUpdate  = $updates

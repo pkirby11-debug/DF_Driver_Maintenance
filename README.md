@@ -71,7 +71,8 @@ These machines are unusual, and the constraints drive most of the code:
 | No module can be installed at runtime (it would be discarded) | **Zero external dependencies.** Windows Update is queried via the built-in `Microsoft.Update.Session` COM API, not PSWindowsUpdate. |
 | Isolated VLAN, no route to the Carle network | No file-share reporting. The endpoint's ThawSpace is the system of record; a collector picks reports up out-of-band. HTML reports are fully self-contained — no CDN references, since they would render broken. |
 | No SCCM client | No ConfigMgr inventory to lean on; the module collects its own. |
-| Windows PowerShell 5.1 is what is on the box | Targets 5.1. No PS7-only syntax. |
+| Windows PowerShell 5.1 is what is on the box | Targets 5.1. No PS7-only syntax. All files written via `Write-DFTextFile`, because `Set-Content -Encoding UTF8` emits a BOM on 5.1 but not on 7.x, and a BOM makes `latest.json` unreadable to the collector. |
+| Scan runs as SYSTEM | Per-user software is read from the loaded hives under `HKEY_USERS`, never `HKCU` — under SYSTEM, `HKCU` is SYSTEM's own profile and would silently report nothing. Profiles not loaded at scan time are not visible; machine-wide coverage is complete. |
 | Public-facing, unattended, hospital setting | Scans run as SYSTEM, never prompt, never throw out of the top level, and log to a durable JSON Lines file. |
 
 ---
@@ -145,6 +146,7 @@ without parsing the report:
 | `DF001` | Critical | Machine is **Thawed** — protection not active |
 | `DF002` | Warning | Freeze state could not be determined |
 | `DF003` | Critical | Deep Freeze client not detected |
+| `DF004` | Critical | State path is not persistent — this report dies on the next Frozen reboot |
 | `WU001` | Warning | Reboot pending while Frozen — the work will be discarded, not applied |
 | `WU002` | Critical | Critical/important updates pending |
 | `WU003` | Info | Non-critical updates pending |
@@ -153,6 +155,13 @@ without parsing the report:
 | `WU006` | Warning | No successful install in recorded history |
 | `DRV001` | Warning | Device(s) in an error state |
 | `DRV002` | Info | Third-party driver(s) past the staleness threshold |
+| `DRV003` | Warning | Driver inventory itself failed (e.g. WMI repository corruption) |
+| `SW001` | Warning | Software inventory itself failed |
+
+`DF004`, `DRV003` and `SW001` exist because a collector cannot tell "nothing was wrong"
+from "the check never ran". Without them a machine with no ThawSpace, or one whose WMI
+repository is corrupt, scans clean and reports `Healthy` — while its report is discarded
+on the next reboot or its driver inventory is silently empty.
 
 `WU001` and `WU005` are the two worth watching. Together they catch the specific
 silent failure this project exists for: a machine that appears to be patching on

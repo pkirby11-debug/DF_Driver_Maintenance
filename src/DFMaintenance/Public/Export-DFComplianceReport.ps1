@@ -9,16 +9,25 @@ function Export-DFComplianceReport {
           reports\<COMPUTER>_<timestamp>.json  - the full historical record
           reports\latest.json                  - a stable path for a collector to read
 
-        On this isolated VLAN there is no file share to report into, so the
-        machine's own ThawSpace is the system of record and a collector picks the
-        files up out-of-band. 'latest.json' exists so the collector does not have
-        to sort filenames to find the current state.
+        On this isolated VLAN there is no file share to report into, so the machine's own
+        ThawSpace is the system of record and a collector picks the files up out-of-band.
+        'latest.json' exists so the collector does not have to sort filenames.
 
-        Writes are staged to a temporary file and then moved into place, so a
-        collector never reads a half-written report.
+        Both files are staged to a temporary file and then moved into place, so a collector
+        never reads a half-written report.
+
+        All text is written as BOM-less UTF-8 via Write-DFTextFile. Set-Content -Encoding
+        UTF8 would prefix a BOM on Windows PowerShell 5.1 (but not on 7.x), which is
+        exactly what a non-PowerShell JSON parser chokes on.
+
+        Retention runs BEFORE the write: the volume filling up is a real failure mode on a
+        machine nobody visits, and pruning first lets a full volume recover on its own
+        instead of failing every subsequent write.
 
     .OUTPUTS
-        PSCustomObject describing where the report was written.
+        PSCustomObject describing where the report was written. On a write failure it still
+        returns an object, with JsonPath = $null and WriteError set, so the caller can
+        report the failure rather than losing the findings entirely.
 
     .EXAMPLE
         Get-DFComplianceSnapshot | Export-DFComplianceReport
@@ -34,19 +43,24 @@ function Export-DFComplianceReport {
 
         [string] $StatePath,
 
+        [string] $ConfigPath,
+
         # Also render a human-readable HTML summary for local viewing.
         [switch] $IncludeHtml,
 
-        # Reports and logs older than this are pruned. Defaults to the
-        # configured LogRetentionDays. A ThawSpace volume that fills up on a
-        # machine nobody visits is a real failure mode, so pruning lives here
-        # with the writer rather than in a caller that might forget.
+        # Reports and logs older than this are pruned. Defaults to the configured
+        # LogRetentionDays.
         [ValidateRange(1, 3650)]
         [int] $RetentionDays
     )
 
     process {
-        $state = Resolve-DFStatePath -StatePath $StatePath
+        $config = Get-DFConfig -ConfigPath $ConfigPath
+
+        $effectiveStatePath = if ($StatePath) { $StatePath } else { $config.StatePath }
+        $state = Set-DFStateContext -StatePath $effectiveStatePath `
+                                    -ThawSpaceLabelPattern $config.ThawSpaceLabelPattern
+
         $reportDir = Join-Path $state.Path 'reports'
         New-Item -Path $reportDir -ItemType Directory -Force | Out-Null
 
@@ -60,38 +74,74 @@ function Export-DFComplianceReport {
 
         if (-not $PSCmdlet.ShouldProcess($jsonPath, 'Write compliance report')) { return }
 
-        $json = $Snapshot | ConvertTo-Json -Depth 8
-
-        # Stage then move, so a collector never sees a partial file.
-        $temp = "$jsonPath.tmp"
-        Set-Content -LiteralPath $temp -Value $json -Encoding UTF8
-        Move-Item -LiteralPath $temp -Destination $jsonPath -Force
-        Copy-Item -LiteralPath $jsonPath -Destination $latestPath -Force
-
-        $htmlPath = $null
-        if ($IncludeHtml) {
-            $htmlPath = Join-Path $reportDir 'latest.html'
-            ConvertTo-DFHtmlReport -Snapshot $Snapshot | Set-Content -LiteralPath $htmlPath -Encoding UTF8
+        # $RetentionDays carries a [ValidateRange] attribute, and PowerShell attaches
+        # validation to the VARIABLE -- assigning a config value straight back into it
+        # re-runs validation and throws for anything outside 1..3650. Nothing range-checks
+        # LogRetentionDays in the config file, so "LogRetentionDays": 0 (a plausible way to
+        # try to disable pruning) would abort the scan. Clamp into an unvalidated local.
+        $effectiveRetention = 90
+        if ($PSBoundParameters.ContainsKey('RetentionDays')) {
+            $effectiveRetention = $RetentionDays
+        } else {
+            $configured = $config.LogRetentionDays
+            if ($configured -is [int] -and $configured -ge 1 -and $configured -le 3650) {
+                $effectiveRetention = $configured
+            } else {
+                Write-DFLog -Level 'Warning' -Component 'Report' `
+                    -Message "LogRetentionDays '$configured' is out of range 1-3650; using 90."
+            }
         }
 
-        Write-DFLog -Component 'Report' -Message "Report written to $jsonPath" `
-            -Data @{ Path = $jsonPath; Persistent = $state.IsPersistent }
-
-        if (-not $PSBoundParameters.ContainsKey('RetentionDays')) {
-            # Read the config that belongs to the state path actually in use,
-            # rather than re-resolving independently and possibly reading a
-            # different machine's config when -StatePath was passed explicitly.
-            $RetentionDays = (Get-DFConfig -ConfigPath (Join-Path $state.Path 'dfmaintenance.json')).LogRetentionDays
+        $pruned = 0
+        try {
+            $pruned = Invoke-DFRetention -StatePath $state.Path -RetentionDays $effectiveRetention
+        } catch {
+            Write-DFLog -Level 'Warning' -Component 'Report' `
+                -Message "Retention sweep failed: $($_.Exception.Message)"
         }
-        $pruned = Invoke-DFRetention -StatePath $state.Path -RetentionDays $RetentionDays
+
+        $htmlPath   = $null
+        $writeError = $null
+
+        # The findings were computed in memory before this point. A write failure must be
+        # reported, not allowed to propagate and discard them.
+        try {
+            $json = $Snapshot | ConvertTo-Json -Depth 8
+
+            $temp = "$jsonPath.tmp"
+            Write-DFTextFile -Path $temp -Content $json
+            Move-Item -LiteralPath $temp -Destination $jsonPath -Force
+
+            # latest.json is staged and moved too. A direct copy is not atomic, and a
+            # collector reading mid-copy would see a truncated file.
+            $latestTemp = "$latestPath.tmp"
+            Write-DFTextFile -Path $latestTemp -Content $json
+            Move-Item -LiteralPath $latestTemp -Destination $latestPath -Force
+
+            if ($IncludeHtml) {
+                $htmlPath = Join-Path $reportDir 'latest.html'
+                $htmlTemp = "$htmlPath.tmp"
+                Write-DFTextFile -Path $htmlTemp -Content (ConvertTo-DFHtmlReport -Snapshot $Snapshot)
+                Move-Item -LiteralPath $htmlTemp -Destination $htmlPath -Force
+            }
+
+            Write-DFLog -Component 'Report' -Message "Report written to $jsonPath" `
+                -Data @{ Path = $jsonPath; Persistent = $state.IsPersistent }
+        } catch {
+            $writeError = $_.Exception.Message
+            $jsonPath   = $null
+            Write-DFLog -Level 'Error' -Component 'Report' -Message "Report write failed: $writeError"
+            Write-Warning "Report write failed: $writeError"
+        }
 
         return [PSCustomObject]@{
             JsonPath     = $jsonPath
-            LatestPath   = $latestPath
+            LatestPath   = if ($writeError) { $null } else { $latestPath }
             HtmlPath     = $htmlPath
             StatePath    = $state.Path
             IsPersistent = $state.IsPersistent
             PrunedFiles  = $pruned
+            WriteError   = $writeError
         }
     }
 }

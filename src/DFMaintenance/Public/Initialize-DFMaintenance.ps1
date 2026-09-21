@@ -37,7 +37,7 @@ function Initialize-DFMaintenance {
         [switch] $Force
     )
 
-    $state = Resolve-DFStatePath -StatePath $StatePath
+    $state = Set-DFStateContext -StatePath $StatePath
     Write-Verbose "State directory: $($state.Path) [$($state.Source)]"
 
     if (-not $state.IsPersistent) {
@@ -61,14 +61,16 @@ otherwise every scan result is discarded on the next reboot.
     if ((Test-Path -LiteralPath $configPath) -and -not $Force) {
         Write-Verbose "Config already present at $configPath (use -Force to overwrite)."
     } elseif ($PSCmdlet.ShouldProcess($configPath, 'Write default configuration')) {
-        [ordered]@{
+        $defaultConfig = [ordered]@{
             StatePath             = $state.Path
             ThawSpaceLabelPattern = 'ThawSpace*'
             DFCPath               = (Get-DFCPath)
             LogRetentionDays      = 90
             DriverAgeWarningDays  = 1095
             TrackedSoftware       = @()
-        } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $configPath -Encoding UTF8
+        } | ConvertTo-Json -Depth 4
+        # BOM-free: Set-Content -Encoding UTF8 would prefix a BOM on 5.1.
+        Write-DFTextFile -Path $configPath -Content $defaultConfig
         Write-Verbose "Wrote default config to $configPath"
     }
 

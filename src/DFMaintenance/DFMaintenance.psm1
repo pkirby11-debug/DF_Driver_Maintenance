@@ -24,17 +24,19 @@ foreach ($file in @($private + $public)) {
     }
 }
 
-# Logging target is resolved once at import. If nothing persistent is available
-# the module still loads and simply does not write a log file; a missing log is
-# not a reason to fail a maintenance scan.
+# The logging target is NOT resolved here. It is established per run by
+# Set-DFStateContext, which the entry-point functions call with the same -StatePath and
+# ThawSpaceLabelPattern the reports use.
+#
+# Resolving it at import with no arguments was a bug: -StatePath and the config file's
+# StatePath were honoured for reports but ignored for logs, so on a machine whose
+# ThawSpace volume is labelled anything other than 'ThawSpace*' the reports landed on
+# the durable volume while every log line went to the frozen volume and was destroyed
+# on the next reboot.
+#
+# Until a context is set, Write-DFLog has no target and silently skips writing; a
+# missing log is never a reason to fail a maintenance scan.
 $script:DFLogPath = $null
-try {
-    $state  = Resolve-DFStatePath
-    $logDir = Join-Path $state.Path 'logs'
-    New-Item -Path $logDir -ItemType Directory -Force | Out-Null
-    $script:DFLogPath = Join-Path $logDir ("dfmaintenance-{0}.jsonl" -f (Get-Date -Format 'yyyyMM'))
-} catch {
-    Write-Verbose "Persistent logging unavailable: $($_.Exception.Message)"
-}
+$script:DFState   = $null
 
 Export-ModuleMember -Function $public.BaseName

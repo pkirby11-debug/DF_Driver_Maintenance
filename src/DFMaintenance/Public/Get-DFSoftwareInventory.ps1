@@ -12,8 +12,10 @@ function Get-DFSoftwareInventory {
         that is a visible failure, and on a Frozen machine the repair is discarded
         anyway, so it is all cost and no benefit.
 
-        Covers both 64- and 32-bit hives plus per-user installs under HKCU, which
-        is where browser and helper-app installs on a shared kiosk often land.
+        Covers both 64- and 32-bit machine hives, plus per-user installs from the loaded
+        user hives under HKEY_USERS. HKCU is deliberately NOT used: the scan runs as SYSTEM,
+        so HKCU would be SYSTEM's own profile and would silently report nothing while
+        appearing to cover per-user software.
 
     .OUTPUTS
         PSCustomObject with Software collection and summary counts.
@@ -36,18 +38,43 @@ function Get-DFSoftwareInventory {
         [switch] $IncludeSystemComponents
     )
 
-    $hives = @(
-        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
-        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
-        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
-    )
+    # Machine-wide hives are always readable.
+    $hives = [System.Collections.Generic.List[string]]::new()
+    $hives.Add('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*')
+    $hives.Add('HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*')
+
+    # Per-user installs need care. The scan runs as SYSTEM from Task Scheduler, so HKCU is
+    # SYSTEM's OWN profile -- never a student's -- and reading it would report nothing while
+    # appearing to cover per-user software. Enumerate the loaded user hives under
+    # HKEY_USERS instead, filtered to real user SIDs.
+    #
+    # Limitation: a profile whose hive is not currently loaded (nobody logged on at 03:00,
+    # which is the normal case on a classroom kiosk) is not visible here. Per-user installs
+    # on a shared kiosk are therefore best-effort; machine-wide coverage is complete.
+    $userHiveCount = 0
+    try {
+        # A plain foreach, not a ForEach-Object pipeline: the pipeline scriptblock gets its
+        # own scope, so a counter incremented inside it would not survive.
+        $userKeys = @(
+            Get-ChildItem -Path 'Registry::HKEY_USERS' -ErrorAction Stop |
+                Where-Object { $_.PSChildName -match '^S-1-5-21-[\d-]+$' }
+        )
+        foreach ($userKey in $userKeys) {
+            $hives.Add("Registry::$($userKey.Name)\Software\Microsoft\Windows\CurrentVersion\Uninstall\*")
+            $hives.Add("Registry::$($userKey.Name)\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*")
+            $userHiveCount++
+        }
+    } catch {
+        Write-Verbose "Could not enumerate HKEY_USERS: $($_.Exception.Message)"
+    }
 
     $result = [ordered]@{
-        Computer   = $env:COMPUTERNAME
-        Timestamp  = (Get-Date).ToString('o')
-        TotalCount = 0
-        Software   = @()
-        Error      = $null
+        Computer       = $env:COMPUTERNAME
+        Timestamp      = (Get-Date).ToString('o')
+        TotalCount     = 0
+        UserHivesRead  = 0
+        Software       = @()
+        Error          = $null
     }
 
     try {
@@ -68,7 +95,7 @@ function Get-DFSoftwareInventory {
                     DisplayVersion = $_.DisplayVersion
                     Publisher      = $_.Publisher
                     InstallDate    = if ($installDate) { $installDate.ToString('yyyy-MM-dd') } else { $null }
-                    Scope          = if ($_.PSPath -like '*HKEY_CURRENT_USER*') { 'User' } else { 'Machine' }
+                    Scope          = if ($_.PSPath -like '*HKEY_USERS*') { 'User' } else { 'Machine' }
                     Architecture   = if ($_.PSPath -like '*WOW6432Node*') { 'x86' } else { 'x64' }
                 }
             }
@@ -85,8 +112,9 @@ function Get-DFSoftwareInventory {
             )
         }
 
-        $result.Software   = $software
-        $result.TotalCount = $software.Count
+        $result.Software      = $software
+        $result.TotalCount    = $software.Count
+        $result.UserHivesRead = $userHiveCount
 
         Write-DFLog -Component 'SoftwareInventory' -Message "Software inventory: $($result.TotalCount) entries." `
             -Data @{ Count = $result.TotalCount }
