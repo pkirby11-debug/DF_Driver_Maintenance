@@ -1,0 +1,9 @@
+# Local scan output - reports and logs belong on the endpoint, not in source control
+reports/
+logs/
+*.jsonl
+config/dfmaintenance.json
+
+# PowerShell / editor noise
+*.ps1xml.bak
+.vscode/

@@ -1,0 +1,145 @@
+# Validation checklist
+
+## What has actually been tested
+
+This module was developed in a Linux container with no Windows, no Deep Freeze,
+and no Windows Update Agent. Be clear-eyed about what that means.
+
+**Verified:**
+
+- All 16 PowerShell files parse cleanly (`[Parser]::ParseFile`, 0 errors).
+- 23 logic assertions pass against the platform-independent code:
+  config merge and malformed-JSON fallback, JSON Lines log format and its
+  failure-tolerance, state path resolution, HTML rendering including
+  markup-injection encoding and the no-external-URL requirement, and
+  manifest-to-disk export consistency.
+- Severity rollup produces the correct verdict for empty / Info / Warning /
+  Critical finding sets.
+
+**Not verified — requires a real Windows endpoint:**
+
+- Everything touching Deep Freeze, WMI/CIM, the registry, the Windows Update
+  Agent COM API, and Task Scheduler.
+
+The highest-risk unverified item is called out below.
+
+---
+
+## Verify this first: the DFC.exe exit code
+
+`Get-DFFreezeState` maps `DFC.exe /ISFROZEN` exit codes as:
+
+```
+exit code 1  ->  FROZEN
+exit code 0  ->  THAWED
+```
+
+This mapping comes from Faronics documentation, **not from a test on your
+hardware.** It is inverted from the usual "0 means success" convention, and if it
+is wrong on your Deep Freeze build the tool will confidently report the exact
+opposite of reality — reporting healthy Frozen machines as a critical Thawed
+finding, or worse, reporting a genuinely Thawed public-facing machine as fine.
+
+Confirm it on one machine before trusting any report:
+
+```powershell
+# With the machine FROZEN:
+& 'C:\Program Files\Faronics\Deep Freeze\DFC.exe' /ISFROZEN
+Write-Host "Frozen machine returned: $LASTEXITCODE"    # expect 1
+
+# Thaw via the Cloud console, reboot, then:
+& 'C:\Program Files\Faronics\Deep Freeze\DFC.exe' /ISFROZEN
+Write-Host "Thawed machine returned: $LASTEXITCODE"    # expect 0
+```
+
+If your build returns something different, correct the `switch` block in
+`src/DFMaintenance/Public/Get-DFFreezeState.ps1`. The mapping is deliberately
+written as an explicit switch rather than a boolean cast so it is a one-line fix.
+
+---
+
+## Full checklist
+
+Work through this on a single test machine before any wider deployment.
+
+### 1. Module loads
+
+- [ ] `Import-Module .\src\DFMaintenance\DFMaintenance.psd1 -Force` succeeds on Windows PowerShell 5.1
+- [ ] `Get-Command -Module DFMaintenance` lists all 8 exported functions
+- [ ] Module import does not throw when no ThawSpace volume exists
+
+### 2. State persistence — the foundation
+
+- [ ] `Resolve-DFStatePath` finds a ThawSpace volume and reports `IsPersistent = $true`
+- [ ] With no ThawSpace, it falls back to ProgramData and reports `IsPersistent = $false`
+- [ ] **A report written to ThawSpace survives a Frozen reboot.** Write a report,
+      reboot Frozen, confirm the file is still there. If this fails, nothing else
+      in the module matters.
+- [ ] Adjust `ThawSpaceLabelPattern` if your volume label differs from `ThawSpace*`
+
+### 3. Freeze state
+
+- [ ] The DFC.exe exit code check above
+- [ ] `Get-DFCPath` locates DFC.exe on your build (check the candidate paths — the
+      install location varies by Deep Freeze version)
+- [ ] With DFC.exe absent/renamed, `Get-DFFreezeState` returns `Unknown`, not a guess
+- [ ] Thawed machine produces finding `DF001` at Critical
+
+### 4. Windows Update
+
+- [ ] `Get-DFWindowsUpdateStatus -SkipOnlineSearch` returns OS build and history quickly
+- [ ] Online search completes on the isolated VLAN — **confirm these machines can
+      reach Windows Update at all.** If they are pulling from WSUS or via Deep
+      Freeze Cloud only, the direct COM search may return nothing or fail, and
+      `WU004`/`WU006` will fire constantly and train you to ignore them.
+- [ ] `Test-DFRebootPending` returns `$true` after an update that needs a reboot
+- [ ] `WU001` fires on a Frozen machine with a pending reboot
+
+### 5. Inventory
+
+- [ ] `Get-DFDriverInventory` returns sensible driver counts and ages
+- [ ] `ProblemDevices` correctly lists a device in error state (test by disabling one)
+- [ ] `Get-DFSoftwareInventory` finds your tracked apps; tune `TrackedSoftware`
+- [ ] Confirm the inventory does **not** trigger MSI reconfigure dialogs
+      (the reason `Win32_Product` is avoided — verify this holds in practice)
+
+### 6. Reporting
+
+- [ ] `Export-DFComplianceReport -IncludeHtml` writes JSON and HTML to ThawSpace
+- [ ] `latest.json` is updated each run
+- [ ] HTML renders correctly **with no network connectivity**
+- [ ] Old reports are pruned past `LogRetentionDays`; ThawSpace does not fill up
+      over months of unattended running
+
+### 7. Scheduled execution
+
+- [ ] Task registers and runs as SYSTEM
+- [ ] It completes unattended with no logged-on user
+- [ ] Exit codes map correctly (0/1/2/3)
+- [ ] **The task survives a Frozen reboot** — it must be registered during the
+      same Thawed window that becomes the frozen baseline
+- [ ] The 2-hour execution limit is sufficient for an online search on your slowest machine
+
+### 8. Unit tests
+
+```powershell
+Install-Module Pester -MinimumVersion 5.0 -Scope CurrentUser -Force
+Invoke-Pester .\tests\DFMaintenance.Tests.ps1 -Output Detailed
+```
+
+Note: `tests/DFMaintenance.Tests.ps1` uses Windows path separators and is
+intended to run on Windows.
+
+---
+
+## Deployment sequence
+
+Once the checklist passes on one machine:
+
+1. Pilot on **one** classroom machine. Let it run a full week including at least
+   one Deep Freeze maintenance window.
+2. Read the reports. This is the point of Phase 1 — find out whether DF Cloud's
+   native updating is actually working on these machines. The answer determines
+   whether Phase 2 and 3 are worth building.
+3. Expand to the rest of the classroom only after the pilot data makes sense.
+4. Bake into the image so new machines get it from the baseline.
