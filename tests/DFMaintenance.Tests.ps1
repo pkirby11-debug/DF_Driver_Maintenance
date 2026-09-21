@@ -20,6 +20,7 @@ BeforeAll {
     . (Join-Path $script:ModuleRoot 'Private\Write-DFTextFile.ps1')
     . (Join-Path $script:ModuleRoot 'Private\Set-DFStateContext.ps1')
     . (Join-Path $script:ModuleRoot 'Private\Get-DFCPath.ps1')
+    . (Join-Path $script:ModuleRoot 'Private\Get-DFHardwareIdPrefix.ps1')
 
     $script:TestRoot = Join-Path ([System.IO.Path]::GetTempPath()) "dfmtest-$([guid]::NewGuid().ToString('N'))"
     New-Item -Path $script:TestRoot -ItemType Directory -Force | Out-Null
@@ -246,6 +247,87 @@ Describe 'Get-DFCPath' {
 
     It 'does not throw on a non-existent configured path' {
         { Get-DFCPath -ConfiguredPath (Join-Path $script:TestRoot 'no\such\DFC.exe') } | Should -Not -Throw
+    }
+}
+
+Describe 'Test-DFTrustedExecutablePath' {
+    # Everything this gate returns is executed as SYSTEM by Get-DFFreezeState, and the
+    # path originates in a config file on a volume a kiosk user may be able to write.
+    # These are privilege-escalation tests, not style tests.
+    It 'accepts the real DFC.exe under Program Files' {
+        $p = Join-Path $env:ProgramFiles 'Faronics\Deep Freeze\DFC.exe'
+        Test-DFTrustedExecutablePath -Path $p | Should -BeTrue
+    }
+
+    It 'rejects an executable in a user-writable directory' {
+        Test-DFTrustedExecutablePath -Path 'C:\Users\Public\DFC.exe' | Should -BeFalse
+    }
+
+    It 'rejects a script masquerading as the target' {
+        # The task runs powershell.exe -ExecutionPolicy Bypass, so a .ps1 here would run
+        # in-process as SYSTEM.
+        Test-DFTrustedExecutablePath -Path (Join-Path $env:ProgramFiles 'Faronics\DFC.ps1') | Should -BeFalse
+    }
+
+    It 'rejects a differently-named executable inside a trusted root' {
+        Test-DFTrustedExecutablePath -Path (Join-Path $env:ProgramFiles 'Faronics\payload.exe') | Should -BeFalse
+    }
+
+    It 'rejects a directory whose name merely prefixes a trusted root' {
+        Test-DFTrustedExecutablePath -Path "$($env:ProgramFiles)Evil\DFC.exe" | Should -BeFalse
+    }
+
+    It 'rejects traversal back out of a trusted root' {
+        Test-DFTrustedExecutablePath -Path (Join-Path $env:ProgramFiles '..\Users\Public\DFC.exe') | Should -BeFalse
+    }
+
+    It 'rejects empty and null input' {
+        Test-DFTrustedExecutablePath -Path '' | Should -BeFalse
+    }
+}
+
+Describe 'Get-DFCPath security gate' {
+    It 'does not return an untrusted configured path' {
+        $hostile = 'C:\Users\Public\rec.exe'
+        Get-DFCPath -ConfiguredPath $hostile -WarningAction SilentlyContinue | Should -Not -Be $hostile
+    }
+
+    It 'does not throw when rejecting' {
+        { Get-DFCPath -ConfiguredPath 'C:\Users\Public\rec.exe' -WarningAction SilentlyContinue } |
+            Should -Not -Throw
+    }
+}
+
+Describe 'Get-DFHardwareIdPrefix' {
+    It 'strips the instance id, which is often the hardware serial' {
+        Get-DFHardwareIdPrefix -DeviceID 'USB\VID_046D&PID_C52B\5&1F2E3D4C&0&2' |
+            Should -Be 'USB\VID_046D&PID_C52B'
+    }
+
+    It 'leaves a two-segment id alone' {
+        Get-DFHardwareIdPrefix -DeviceID 'ROOT\SYSTEM' | Should -Be 'ROOT\SYSTEM'
+    }
+
+    It 'returns null for empty input' {
+        Get-DFHardwareIdPrefix -DeviceID '' | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Get-DFConfig hardening' {
+    It 'clamps out-of-range and non-numeric values to defaults' {
+        # These are bound to [ValidateRange] parameters downstream, where PowerShell
+        # re-validates on assignment and throws mid-scan.
+        foreach ($case in @(
+            @{ Json = '{"LogRetentionDays": 0}';     Expected = 90 },
+            @{ Json = '{"LogRetentionDays": 99999}'; Expected = 90 },
+            @{ Json = '{"LogRetentionDays": "abc"}'; Expected = 90 },
+            @{ Json = '{"LogRetentionDays": 30}';    Expected = 30 }
+        )) {
+            $f = Join-Path $script:TestRoot "clamp-$([guid]::NewGuid().ToString('N')).json"
+            $case.Json | Set-Content -LiteralPath $f
+            (Get-DFConfig -ConfigPath $f -WarningAction SilentlyContinue).LogRetentionDays |
+                Should -Be $case.Expected
+        }
     }
 }
 

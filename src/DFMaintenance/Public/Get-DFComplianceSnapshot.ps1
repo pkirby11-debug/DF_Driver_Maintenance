@@ -114,13 +114,18 @@ function Get-DFComplianceSnapshot {
         Add-Finding 'Warning' 'WU004' "Windows Update query failed: $($updates.SearchError)"
     }
 
+    # Operation must be an INSTALL. A successful *uninstallation* (a rolled-back update)
+    # otherwise satisfies "last successful install" and suppresses WU005/WU006 on exactly
+    # the machine that most needs them.
+    # History dates are tagged UTC at the source, so compare against UtcNow -- comparing a
+    # UTC timestamp against local Get-Date skewed this by the site's offset.
     $lastSuccess = $updates.History |
-        Where-Object { $_.Succeeded -and $_.Date } |
+        Where-Object { $_.Succeeded -and $_.Date -and $_.IsInstall } |
         Sort-Object { [datetime]$_.Date } -Descending |
         Select-Object -First 1
 
     if ($lastSuccess) {
-        $daysSince = [math]::Round(((Get-Date) - [datetime]$lastSuccess.Date).TotalDays)
+        $daysSince = [math]::Round(((Get-Date).ToUniversalTime() - ([datetime]$lastSuccess.Date).ToUniversalTime()).TotalDays)
         if ($daysSince -gt $MaintenanceOverdueDays) {
             Add-Finding 'Critical' 'WU005' "No successful update install in $daysSince days. Maintenance window is not doing its job."
         }

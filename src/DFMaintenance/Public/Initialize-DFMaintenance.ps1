@@ -34,7 +34,11 @@ function Initialize-DFMaintenance {
         [string] $ScanTime = '03:00',
 
         # Overwrite an existing config file.
-        [switch] $Force
+        [switch] $Force,
+
+        # Explicit path to Invoke-DFComplianceScan.ps1. Needed whenever the module is
+        # deployed somewhere other than an intact copy of the repository tree.
+        [string] $ScanScriptPath
     )
 
     $state = Set-DFStateContext -StatePath $StatePath
@@ -57,6 +61,14 @@ otherwise every scan result is discarded on the next reboot.
         New-Item -Path (Join-Path $state.Path $sub) -ItemType Directory -Force | Out-Null
     }
 
+    # The config file written below carries DFCPath, which the nightly scan executes as
+    # SYSTEM. A directory created with inherited defaults at a volume root is often
+    # writable by authenticated users, so lock it down before the config lands in it.
+    $secured = Set-DFDirectorySecurity -Path $state.Path
+    if (-not $secured) {
+        Write-Warning "State directory '$($state.Path)' could not be secured automatically. Restrict it to SYSTEM and Administrators before relying on this deployment."
+    }
+
     $configPath = Join-Path $state.Path 'dfmaintenance.json'
     if ((Test-Path -LiteralPath $configPath) -and -not $Force) {
         Write-Verbose "Config already present at $configPath (use -Force to overwrite)."
@@ -76,8 +88,30 @@ otherwise every scan result is discarded on the next reboot.
 
     $taskRegistered = $false
     if ($RegisterScheduledTask -and $PSCmdlet.ShouldProcess('DFMaintenance-ComplianceScan', 'Register scheduled task')) {
-        $scanScript = Join-Path $PSScriptRoot '..\..\..\scripts\Invoke-DFComplianceScan.ps1'
+        if ($ScanScriptPath) {
+            $scanScript = $ScanScriptPath
+        } else {
+            # $PSScriptRoot here is src/DFMaintenance/Public, so three '..' reach the repo
+            # root. That arithmetic is correct, but it only holds while the module sits in
+            # an intact repository tree -- which is not how this gets deployed to a kiosk.
+            $scanScript = Join-Path $PSScriptRoot '..\..\..\scripts\Invoke-DFComplianceScan.ps1'
+        }
         $scanScript = [System.IO.Path]::GetFullPath($scanScript)
+
+        # Registering a task that points at a non-existent script produces a task that
+        # fails silently every night while this function reports TaskRegistered = $true.
+        if (-not (Test-Path -LiteralPath $scanScript)) {
+            Write-Warning "Scan script not found at '$scanScript'. Task NOT registered. Pass -ScanScriptPath, or deploy scripts\Invoke-DFComplianceScan.ps1 alongside the module."
+            return [PSCustomObject]@{
+                StatePath      = $state.Path
+                StateSource    = $state.Source
+                IsPersistent   = $state.IsPersistent
+                ConfigPath     = $configPath
+                FreezeState    = $freeze.State
+                TaskRegistered = $false
+                ScanScriptPath = $scanScript
+            }
+        }
 
         try {
             $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
@@ -106,5 +140,6 @@ otherwise every scan result is discarded on the next reboot.
         ConfigPath     = $configPath
         FreezeState    = $freeze.State
         TaskRegistered = $taskRegistered
+        DirectorySecured = $secured
     }
 }

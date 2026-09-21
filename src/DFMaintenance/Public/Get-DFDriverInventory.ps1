@@ -45,8 +45,10 @@ function Get-DFDriverInventory {
         ThirdPartyCount  = 0
         StaleCount       = 0
         ProblemCount     = 0
+        DisabledCount    = 0
         Drivers          = @()
         ProblemDevices   = @()
+        DisabledDevices  = @()
         Error            = $null
     }
 
@@ -75,7 +77,11 @@ function Get-DFDriverInventory {
                 AgeDays       = if ($driverDate) { [math]::Round(((Get-Date) - $driverDate).TotalDays) } else { $null }
                 IsStale       = ($driverDate -and $driverDate -lt $cutoff)
                 IsMicrosoft   = $isMicrosoft
-                DeviceID      = $d.DeviceID
+                # Only the hardware-class prefix (e.g. USB\VID_046D&PID_C52B). The third
+                # segment of a DeviceID is the instance id, which for many devices is the
+                # hardware SERIAL NUMBER -- a stable per-unit identifier the README claims
+                # these reports do not contain. VID/PID is what driver triage needs anyway.
+                HardwareId    = Get-DFHardwareIdPrefix -DeviceID $d.DeviceID
             }
         }
 
@@ -83,21 +89,43 @@ function Get-DFDriverInventory {
         $result.ThirdPartyCount = @($result.Drivers | Where-Object { -not $_.IsMicrosoft }).Count
         $result.StaleCount      = @($result.Drivers | Where-Object { $_.IsStale }).Count
 
-        # ConfigManagerErrorCode 0 means the device is working correctly.
-        $problems = Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction SilentlyContinue |
-            Where-Object { $_.ConfigManagerErrorCode -and $_.ConfigManagerErrorCode -ne 0 }
+        # ConfigManagerErrorCode 0 means the device is working correctly, but "non-zero"
+        # is not the same as "broken". On a locked-down kiosk some codes are the INTENDED
+        # state -- IT disables webcams, Bluetooth and card readers deliberately -- and
+        # treating them as faults raises a permanent DRV001 Warning that never clears and
+        # trains everyone to ignore the finding.
+        #
+        #   22 CM_PROB_DISABLED         device deliberately disabled
+        #   24 CM_PROB_DEVICE_NOT_THERE device not present
+        #   45 CM_PROB_PHANTOM          not currently connected (e.g. undocked, unplugged)
+        $benignCodes = @(22, 24, 45)
+
+        $nonZero = @(
+            Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction SilentlyContinue |
+                Where-Object { $_.ConfigManagerErrorCode -and $_.ConfigManagerErrorCode -ne 0 }
+        )
+
+        $asRecord = {
+            param($d)
+            [PSCustomObject]@{
+                Name       = $d.Name
+                HardwareId = Get-DFHardwareIdPrefix -DeviceID $d.DeviceID
+                ErrorCode  = $d.ConfigManagerErrorCode
+                Status     = $d.Status
+            }
+        }
 
         $result.ProblemDevices = @(
-            $problems | ForEach-Object {
-                [PSCustomObject]@{
-                    Name        = $_.Name
-                    DeviceID    = $_.DeviceID
-                    ErrorCode   = $_.ConfigManagerErrorCode
-                    Status      = $_.Status
-                }
-            }
+            $nonZero | Where-Object { $_.ConfigManagerErrorCode -notin $benignCodes } |
+                ForEach-Object { & $asRecord $_ }
         )
-        $result.ProblemCount = $result.ProblemDevices.Count
+        # Kept separately for visibility: useful to see, never a finding.
+        $result.DisabledDevices = @(
+            $nonZero | Where-Object { $_.ConfigManagerErrorCode -in $benignCodes } |
+                ForEach-Object { & $asRecord $_ }
+        )
+        $result.ProblemCount  = $result.ProblemDevices.Count
+        $result.DisabledCount = $result.DisabledDevices.Count
 
         Write-DFLog -Component 'DriverInventory' `
             -Message "Drivers: $($result.TotalDrivers) total, $($result.StaleCount) stale, $($result.ProblemCount) in error." `

@@ -15,22 +15,26 @@ function ConvertTo-DFHtmlReport {
         [PSCustomObject] $Snapshot
     )
 
-    $statusColor = switch ($Snapshot.OverallStatus) {
-        'Critical' { '#b91c1c' }
-        'Warning'  { '#b45309' }
-        'Info'     { '#1d4ed8' }
-        default    { '#15803d' }
+    # Map to a fixed CSS CLASS, never an interpolated colour. $statusColor and the per-row
+    # colour were the only values reaching the page outside the HTML encoder, and one of
+    # them landed inside a <style> block where HTML encoding would not have helped anyway.
+    # With a closed set of class names, no computed value reaches CSS at all.
+    $statusClass = switch ($Snapshot.OverallStatus) {
+        'Critical' { 'sev-critical' }
+        'Warning'  { 'sev-warning' }
+        'Info'     { 'sev-info' }
+        default    { 'sev-ok' }
     }
 
     $enc = { param($s) [System.Net.WebUtility]::HtmlEncode([string]$s) }
 
     $findingRows = foreach ($f in $Snapshot.Findings) {
-        $color = switch ($f.Severity) {
-            'Critical' { '#b91c1c' }
-            'Warning'  { '#b45309' }
-            default    { '#1d4ed8' }
+        $rowClass = switch ($f.Severity) {
+            'Critical' { 'sev-critical' }
+            'Warning'  { 'sev-warning' }
+            default    { 'sev-info' }
         }
-        "<tr><td style='color:$color;font-weight:600'>$(& $enc $f.Severity)</td><td>$(& $enc $f.Code)</td><td>$(& $enc $f.Message)</td></tr>"
+        "<tr><td class='$rowClass'>$(& $enc $f.Severity)</td><td>$(& $enc $f.Code)</td><td>$(& $enc $f.Message)</td></tr>"
     }
     if (-not $findingRows) { $findingRows = "<tr><td colspan='3'>No findings.</td></tr>" }
 
@@ -46,14 +50,18 @@ function ConvertTo-DFHtmlReport {
 <style>
  body{font-family:Segoe UI,system-ui,sans-serif;margin:2rem;color:#111;background:#fff}
  h1{font-size:1.4rem;margin:0 0 .25rem}
- .status{display:inline-block;padding:.25rem .75rem;border-radius:.25rem;color:#fff;background:$statusColor;font-weight:600}
+ .status{display:inline-block;padding:.25rem .75rem;border-radius:.25rem;color:#fff;font-weight:600}
+ .status.sev-critical{background:#b91c1c} .status.sev-warning{background:#b45309}
+ .status.sev-info{background:#1d4ed8} .status.sev-ok{background:#15803d}
+ td.sev-critical{color:#b91c1c;font-weight:600} td.sev-warning{color:#b45309;font-weight:600}
+ td.sev-info{color:#1d4ed8;font-weight:600}
  table{border-collapse:collapse;width:100%;margin:1rem 0}
  th,td{text-align:left;padding:.4rem .6rem;border-bottom:1px solid #e5e7eb;font-size:.9rem;vertical-align:top}
  th{background:#f3f4f6}
  .meta{color:#6b7280;font-size:.85rem}
 </style></head><body>
 <h1>$(& $enc $Snapshot.Computer)</h1>
-<p><span class="status">$(& $enc $Snapshot.OverallStatus)</span></p>
+<p><span class="status $statusClass">$(& $enc $Snapshot.OverallStatus)</span></p>
 <p class="meta">Generated $(& $enc $Snapshot.Timestamp)<br>
 Freeze state: <strong>$(& $enc $Snapshot.FreezeState.State)</strong> &middot;
 OS $(& $enc $Snapshot.WindowsUpdate.OSCaption) $(& $enc $Snapshot.WindowsUpdate.DisplayVersion) (build $(& $enc $Snapshot.WindowsUpdate.OSBuild))<br>

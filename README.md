@@ -46,11 +46,12 @@ automatically present.
 **This module fills those four gaps.** It is a read-only reporter. It does not
 thaw, freeze, install, or reboot anything.
 
-### Why read-only, for now
+### Why the scan is read-only
 
-Phase 1 is deliberately incapable of changing machine state, because:
+The **scan** path — `Get-DFComplianceSnapshot`, `Export-DFComplianceReport` and everything
+they call — changes no machine state. That matters because:
 
-- It can be deployed to production classroom machines with no change-control risk.
+- It can run nightly on production classroom machines with no change-control risk.
 - It produces the data needed to decide whether Phase 2 and 3 are justified at
   all — rather than assuming DF Cloud's native updating is failing.
 - It never needs the Deep Freeze password, so no credential is stored on a
@@ -58,6 +59,28 @@ Phase 1 is deliberately incapable of changing machine state, because:
 
 That last point is a hard design constraint, not a convenience. See
 [Security notes](#security-notes).
+
+### The one state-changing entry point
+
+`Initialize-DFMaintenance` is **not** read-only, and the distinction is worth stating
+plainly rather than describing the module as a whole as incapable of changing state. It:
+
+- creates the state directory and its `reports`/`logs` children
+- applies an explicit DACL restricting them to SYSTEM and Administrators, with read-only
+  access for users
+- writes `dfmaintenance.json`
+- with `-RegisterScheduledTask`, registers a **daily task running as SYSTEM at Highest
+  privilege**, which `-Force` will replace if one already exists
+
+It is a setup-time operation run deliberately by an administrator on a Thawed machine, not
+part of the nightly job.
+
+`dfmaintenance.json` carries `DFCPath`, and the scan **executes** that path as SYSTEM.
+`Get-DFCPath` therefore accepts it only if it is a `DFC.exe` under `%ProgramFiles%`,
+`%ProgramFiles(x86)%` or `%SystemRoot%`; anything else is logged and ignored. Together with
+the DACL, that closes a config-file-to-SYSTEM-code-execution path on a machine students
+physically use. If `DirectorySecured` comes back `$false`, secure the directory by hand
+before relying on the deployment.
 
 ---
 
@@ -179,7 +202,17 @@ error surfaced anywhere.
   from the Cloud console, not from a secret baked into an endpoint script.
 - **Do not put secrets in `dfmaintenance.json`.** It sits on a kiosk volume.
 - **Report contents** are inventory data (hostname, OS build, driver and software
-  versions). No PHI, no user data. Confirm this still holds if you extend it.
+  versions). No PHI, no user data. Device identifiers are truncated to the hardware-class
+  prefix (`USB\VID_046D&PID_C52B`) because the instance id that follows is, for many
+  devices, the hardware **serial number** — a stable per-unit identifier. Confirm this
+  still holds if you extend it.
+- **`DFCPath` is executed as SYSTEM.** It is validated against a closed set of
+  administrator-controlled directories. Do not loosen that check, and do not reinstate a
+  bare `PATH` search — any user-writable directory on `PATH` would become a SYSTEM
+  execution source whenever Deep Freeze is absent or renamed.
+- **The state directory is ACL'd** to SYSTEM and Administrators at setup. It holds the
+  config that steers a SYSTEM-executed path, so a user-writable state directory is a
+  privilege-escalation vector, not just untidy.
 - Changes to public-facing hospital endpoints should go through your normal
   change-control process, even read-only ones.
 

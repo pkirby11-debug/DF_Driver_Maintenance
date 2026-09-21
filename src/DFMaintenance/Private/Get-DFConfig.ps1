@@ -42,11 +42,39 @@ function Get-DFConfig {
         return [PSCustomObject]$defaults
     }
 
+    # Numeric keys are bound to [ValidateRange] parameters downstream, and PowerShell
+    # re-validates on assignment -- so an out-of-range or non-numeric value from this file
+    # throws mid-scan rather than being ignored. The config sits on a volume a kiosk user
+    # may be able to write, so every numeric value is type-checked and range-checked HERE,
+    # once, and falls back to the default rather than propagating.
+    $numericRanges = @{
+        LogRetentionDays     = @{ Min = 1; Max = 3650 }
+        DriverAgeWarningDays = @{ Min = 0; Max = 10000 }
+    }
+
     foreach ($key in @($defaults.Keys)) {
-        $value = $raw.PSObject.Properties[$key]
-        if ($null -ne $value -and $null -ne $value.Value) {
-            $defaults[$key] = $value.Value
+        $property = $raw.PSObject.Properties[$key]
+        if ($null -eq $property -or $null -eq $property.Value) { continue }
+        $value = $property.Value
+
+        if ($numericRanges.ContainsKey($key)) {
+            $parsed = 0
+            if (-not [int]::TryParse([string]$value, [ref]$parsed)) {
+                Write-DFLog -Level 'Warning' -Component 'Config' `
+                    -Message "Config '$key' value '$value' is not an integer; using default $($defaults[$key])."
+                continue
+            }
+            $range = $numericRanges[$key]
+            if ($parsed -lt $range.Min -or $parsed -gt $range.Max) {
+                Write-DFLog -Level 'Warning' -Component 'Config' `
+                    -Message "Config '$key' value $parsed is outside $($range.Min)-$($range.Max); using default $($defaults[$key])."
+                continue
+            }
+            $defaults[$key] = $parsed
+            continue
         }
+
+        $defaults[$key] = $value
     }
 
     return [PSCustomObject]$defaults

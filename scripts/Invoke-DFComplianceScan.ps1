@@ -71,7 +71,13 @@ try {
         default    { exit 0 }
     }
 } catch {
-    Write-Error "Compliance scan failed: $($_.Exception.Message)"
-    Write-Error $_.ScriptStackTrace
+    # -ErrorAction Continue is required, not cosmetic. $ErrorActionPreference='Stop' is set
+    # at the top of this script, which escalates Write-Error to a TERMINATING error -- and
+    # raised inside a catch block there is no enclosing try, so the script dies right here
+    # and exits 1. Exit code 1 is defined by this script's own contract as "Warning-level
+    # findings", so a scan that failed outright was being reported as a mild warning and
+    # exit 3 was unreachable. Verified empirically.
+    Write-Error "Compliance scan failed: $($_.Exception.Message)" -ErrorAction Continue
+    Write-Error $_.ScriptStackTrace -ErrorAction Continue
     exit 3
 }

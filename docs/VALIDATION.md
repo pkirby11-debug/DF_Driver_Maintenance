@@ -100,6 +100,14 @@ Work through this on a single test machine before any wider deployment.
       Freeze Cloud only, the direct COM search may return nothing or fail, and
       `WU004`/`WU006` will fire constantly and train you to ignore them.
 - [ ] `Test-DFRebootPending` returns `$true` after an update that needs a reboot
+- [ ] **`PendingDriver` is meaningful.** The search criteria returns software updates; WUA
+      generally needs the Microsoft Update service and an explicit `Type='Driver'` search to
+      return drivers. Confirm on an endpoint with a known-pending driver update whether
+      `PendingDriver` is ever non-zero. If it is always 0, treat the field as unimplemented
+      rather than as "no driver updates pending".
+- [ ] **`RebootNeeded` is not universally true.** Windows 10/11 cumulative updates are
+      bundles, whose `InstallationBehavior` can be a null pointer; the code now reports
+      `$null` (unknown) rather than guessing `$true`.
 - [ ] `WU001` fires on a Frozen machine with a pending reboot
 
 ### 5. Inventory
@@ -137,10 +145,31 @@ Work through this on a single test machine before any wider deployment.
 
 - [ ] Task registers and runs as SYSTEM
 - [ ] It completes unattended with no logged-on user
-- [ ] Exit codes map correctly (0/1/2/3)
+- [ ] Exit codes map correctly (0/1/2/3). In particular force a scan failure and confirm
+      it exits **3**, not 1 — `Write-Error` inside the catch under `$ErrorActionPreference='Stop'`
+      previously escalated to terminating and killed the script with exit 1, which this
+      script's own contract defines as "Warning-level findings".
 - [ ] **The task survives a Frozen reboot** — it must be registered during the
       same Thawed window that becomes the frozen baseline
 - [ ] The 2-hour execution limit is sufficient for an online search on your slowest machine
+
+### 7b. Security (do not skip — these are privilege-escalation checks)
+
+The scan runs as SYSTEM and executes the `DFCPath` from a config file on the state volume.
+
+- [ ] **Hostile DFCPath is rejected.** Put `{"DFCPath":"C:\\Users\\Public\\calc.exe"}` in
+      `dfmaintenance.json`, run a scan, and confirm it is logged and ignored — not executed.
+      Confirm `Get-DFFreezeState` falls through to the real DFC.exe.
+- [ ] **State directory is not user-writable.** As a standard (non-admin) kiosk account,
+      confirm you cannot write to the state directory or modify `dfmaintenance.json`:
+      ```powershell
+      (Get-Acl 'T:\DFMaintenance').Access | Format-Table IdentityReference, FileSystemRights
+      # expect SYSTEM and Administrators FullControl, Users ReadAndExecute only
+      ```
+      `Initialize-DFMaintenance` returns `DirectorySecured`; if it is `$false`, fix it by hand.
+- [ ] **Reports carry no hardware serials.** Confirm `HardwareId` values in `latest.json`
+      look like `USB\VID_046D&PID_C52B` with no trailing instance/serial segment.
+- [ ] **HTML report has no interpolated colours** — severity is carried by CSS class.
 
 ### 8. Unit tests
 

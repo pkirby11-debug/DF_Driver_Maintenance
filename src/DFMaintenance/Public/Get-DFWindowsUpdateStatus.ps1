@@ -33,12 +33,17 @@ function Get-DFWindowsUpdateStatus {
 
         # How many past update-history entries to return.
         [ValidateRange(0, 200)]
-        [int] $HistoryCount = 15,
-
-        # Seconds to allow the online search before giving up.
-        [ValidateRange(30, 3600)]
-        [int] $SearchTimeoutSeconds = 300
+        [int] $HistoryCount = 15
     )
+
+    # NOTE ON TIMEOUTS
+    # This function previously declared a -SearchTimeoutSeconds parameter that was never
+    # read by anything -- a promise to the operator that the code did not keep.
+    # IUpdateSearcher.Search() is a synchronous, blocking COM call with no timeout argument,
+    # so honouring such a parameter requires the asynchronous BeginSearch/RequestAbort path.
+    # Rather than keep an inert knob, the parameter is removed: the real bound on this call
+    # is the scheduled task's ExecutionTimeLimit (2 hours as registered by
+    # Initialize-DFMaintenance). See docs/VALIDATION.md.
 
     $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
 
@@ -71,9 +76,24 @@ function Get-DFWindowsUpdateStatus {
                 $take = [math]::Min($HistoryCount, $total)
                 $status.History = @(
                     $searcher.QueryHistory(0, $take) | ForEach-Object {
+                        # IUpdateHistoryEntry.Date is UTC, but COM marshals it with
+                        # DateTimeKind.Unspecified. Tagging it explicitly keeps the
+                        # 'days since last successful install' maths from drifting by the
+                        # machine's UTC offset, which on a -06:00 site silently shifts
+                        # every comparison by a quarter of a day.
+                        $utcDate = $null
+                        if ($_.Date) {
+                            $utcDate = [datetime]::SpecifyKind($_.Date, [DateTimeKind]::Utc)
+                        }
                         [PSCustomObject]@{
                             Title      = $_.Title
-                            Date       = if ($_.Date) { $_.Date.ToString('o') } else { $null }
+                            Date       = if ($utcDate) { $utcDate.ToString('o') } else { $null }
+                            # UpdateOperation: 1 = Installation, 2 = Uninstallation.
+                            # A successful UNINSTALL must not count as a successful install,
+                            # or a machine whose only recent history is a rolled-back update
+                            # looks freshly patched.
+                            Operation   = $_.Operation
+                            IsInstall   = ($_.Operation -eq 1)
                             # ResultCode 2 = Succeeded, 3 = Succeeded with errors, 4 = Failed
                             ResultCode = $_.ResultCode
                             Succeeded  = ($_.ResultCode -in 2, 3)
@@ -87,7 +107,13 @@ function Get-DFWindowsUpdateStatus {
         if (-not $SkipOnlineSearch) {
             Write-DFLog -Component 'WindowsUpdate' -Message 'Starting online update search.'
 
-            # Driver updates only surface when the search includes driver types.
+            # This criteria returns SOFTWARE updates. The WUA default ServerSelection does
+            # not reliably return driver updates -- those generally require the Microsoft
+            # Update service and an explicit Type='Driver' search. PendingDriver below is
+            # therefore a best-effort count of whatever drivers this search happens to
+            # return, and may legitimately be 0 on a machine with pending driver updates.
+            # docs/VALIDATION.md carries a step to confirm the real behaviour on an
+            # endpoint before anyone relies on this number.
             $criteria = "IsInstalled=0 and IsHidden=0"
             $searchResult = $searcher.Search($criteria)
 
@@ -106,7 +132,15 @@ function Get-DFWindowsUpdateStatus {
                         Severity     = $_.MsrcSeverity
                         IsDriver     = ($_.Type -eq 2)
                         SizeMB       = [math]::Round($_.MaxDownloadSize / 1MB, 2)
-                        RebootNeeded = $_.InstallationBehavior.RebootBehavior -ne 0
+                        # IUpdate::get_InstallationBehavior can return a null pointer even
+                        # on success -- the documented case for BUNDLES, which is what
+                        # Windows 10/11 cumulative updates are. Dereferencing null yields
+                        # $null -ne 0 -> $true, so every bundled update was reported as
+                        # requiring a reboot. Keep 'unknown' as $null rather than guessing.
+                        RebootNeeded = $(
+                            $ib = $_.InstallationBehavior
+                            if ($null -eq $ib) { $null } else { $ib.RebootBehavior -ne 0 }
+                        )
                     }
                 }
             )
