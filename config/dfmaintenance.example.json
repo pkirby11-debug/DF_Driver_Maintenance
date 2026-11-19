@@ -1,0 +1,19 @@
+{
+  "_comment": "Copy to the ThawSpace state directory as dfmaintenance.json. NEVER put the Deep Freeze password or any other secret in this file - it sits on a public-facing endpoint.",
+
+  "StatePath": "T:\\DFMaintenance",
+  "ThawSpaceLabelPattern": "ThawSpace*",
+  "DFCPath": null,
+  "LogRetentionDays": 90,
+  "DriverAgeWarningDays": 1095,
+
+  "TrackedSoftware": [
+    "Google Chrome",
+    "Mozilla Firefox",
+    "Microsoft Edge",
+    "Adobe Acrobat",
+    "Zoom",
+    "Java",
+    "VLC"
+  ]
+}
