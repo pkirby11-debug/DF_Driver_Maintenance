@@ -87,7 +87,8 @@ before relying on the deployment.
 `scripts/Invoke-DFDcuMaintenance.ps1` is **not part of the module, and it is deliberately
 state-changing**. It installs BIOS, firmware and driver updates with Dell Command | Update and
 restarts machines. It does that only inside the nightly maintenance window, and only while
-`DFC.exe get /ISFROZEN` reports the machine Thawed. It takes DCU's restarts itself, inside the
+`DFC.exe get /ISFROZEN` reports the machine Thawed. It lets Software Updater's Windows Updates
+go first and never restarts on top of an install. It takes DCU's restarts itself, inside the
 window, so the work is kept. You push it once per machine from the Deep Freeze Cloud console,
 and it installs a SYSTEM scheduled task.
 
@@ -124,8 +125,8 @@ Import-Module .\src\DFMaintenance\DFMaintenance.psd1
 
 # 2. Set up state directory, config and the daily scan task.
 #    Schedule it AFTER the Deep Freeze maintenance window closes (06:00 here). Inside the
-#    window the machine is Thawed by design, so a scan there reports DF001 every night. After
-#    the window, it does its real job: confirming the machine actually refroze.
+#    window Deep Freeze is thawed or disabled by design, so a scan there reports DF001 every
+#    night. After the window, it does its real job: confirming the machine actually refroze.
 Initialize-DFMaintenance -StatePath 'T:\DFMaintenance' `
                          -RegisterScheduledTask `
                          -ScanTime '06:30' -Verbose

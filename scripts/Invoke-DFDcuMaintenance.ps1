@@ -25,20 +25,33 @@
 
       Uninstall  Removes the task and the installed files. Also needs a Thawed machine.
 
+    WHAT THAWS THE MACHINE
+      Deep Freeze Cloud does: either a Maintenance Period (General Settings) that disables the
+      Deep Freeze service for the window, or a Thawed Period workstation task. This script never
+      thaws anything and holds no Deep Freeze password; it only checks that the machine is Thawed.
+
+    SHARING THE WINDOW WITH SOFTWARE UPDATER / WINDOWS UPDATE
+      * The first pass of a night starts no earlier than WindowStart + StartDelayMinutes
+        (default 120, i.e. 00:00), so Windows Update goes first.
+      * Before installing, and again before any restart, it waits up to ServicingWaitMinutes for
+        Windows servicing (TiWorker.exe) and MSI installs to finish. It never restarts the
+        machine on top of an install: a restart it still needs is deferred to the next trigger.
+      * A restart by someone else (Software Updater after Windows Update, say) mid-pass is
+        expected. The next run records the interrupted pass and carries on.
+
     THE SCHEDULE IT REGISTERS (defaults)
-      * Daily at WindowStart + 10 min, repeating every 60 min until the install cutoff, so a
-        run that found the machine still Frozen is retried later in the window.
-      * At startup (+5 min). Continues a restart chain, and catches Deep Freeze's own Thawed
-        restart at the start of the window.
+      * Daily at WindowStart + StartDelayMinutes, repeating every 60 min until the restart
+        cutoff, so a run that found the machine Frozen or busy is retried later in the window.
+      * At startup (+5 min), which continues a restart chain.
       Every run decides for itself whether there is anything to do, so the extra triggers cost
-      a few seconds each. The first pass of a night waits a random 0-20 min so a fleet that
-      Deep Freeze thawed at the same minute does not download from Dell at the same minute.
+      a few seconds each. The first pass also waits a random 0-20 min so a fleet does not all
+      download from Dell at the same minute.
 
     WHY IT CHECKS THE FREEZE STATE
       Anything installed on a Frozen machine is thrown away at the next restart, and DCU then
       offers the same updates the next night, restarts included, forever. A run on a Frozen
-      machine installs nothing and records SkippedFrozen. If that repeats every night, the
-      Deep Freeze Thawed Period is not covering the window.
+      machine installs nothing and records SkippedFrozen. If that repeats every night, Deep
+      Freeze is not being thawed or disabled for the window.
 
     WHY IT RESTARTS THE MACHINE ITSELF
       BIOS and many driver updates finish during the restart after they are installed. If that
@@ -132,7 +145,8 @@
      3010     A restart was scheduled to finish installing; the next pass runs after it
         1     Skipped: outside the window, or too close to its end to start
         2     Skipped: machine Frozen, or freeze state could not be confirmed
-        3     Skipped: pass limit reached with updates left, servicing busy, or another run active
+        3     Skipped: pass limit reached with updates left, Windows Update / an installer busy
+              (so a pass, or a restart, was deferred to the next trigger), or another run active
         4     DCU unavailable: not installed, too old, untrusted binary, service missing or
               disabled, not a Dell, or model unsupported
         5     DCU failed (scan/apply/download error, timeout, low disk); retried next trigger
@@ -201,7 +215,8 @@ $script:DcuDefaults = [ordered]@{
     UpdateType            = @('bios', 'firmware', 'driver')            # + application, others
     UpdateSeverity        = @('security', 'critical', 'recommended')   # + optional
     UpdateDeviceCategory  = @()          # empty = all categories
-    StartDelayMinutes     = 10           # first scheduled run = WindowStart + this
+    StartDelayMinutes     = 120          # first pass no earlier than WindowStart + this, so Windows
+                                         # Update goes first. Unset, it is capped at 1/4 of the window.
     RandomDelayMinutes    = 20           # first pass of a night waits a random 0..this
     RetryIntervalMinutes  = 60           # re-check through the window; 0 = no repeats
     InstallCutoffMinutes  = 90           # no new DCU pass this close to WindowEnd
@@ -435,10 +450,14 @@ function ConvertTo-DcuConfig {
     $config = [ordered]@{}
     foreach ($key in $script:DcuDefaults.Keys) { $config[$key] = $script:DcuDefaults[$key] }
     foreach ($key in $script:DcuInstallKeys) { $config[$key] = $null }
+    # Keys the admin actually set. A cross-field clash is a problem when they set the value, and
+    # a silent adjustment when it is only a default that does not fit their window.
+    $supplied = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 
     foreach ($key in @($config.Keys)) {
         $value = Get-DcuValue -Object $Raw -Name $key
         if ($null -eq $value) { continue }
+        [void]$supplied.Add($key)
 
         if ($script:DcuIntRanges.ContainsKey($key)) {
             $number = 0
@@ -519,17 +538,28 @@ function ConvertTo-DcuConfig {
     }
     $maxInstallCutoff = $length - 30
     if ($config.InstallCutoffMinutes -gt $maxInstallCutoff) {
-        $problems.Add("InstallCutoffMinutes $($config.InstallCutoffMinutes) leaves less than 30 min of a $length-min window; using $maxInstallCutoff.")
+        if ($supplied.Contains('InstallCutoffMinutes')) {
+            $problems.Add("InstallCutoffMinutes $($config.InstallCutoffMinutes) leaves less than 30 min of a $length-min window; using $maxInstallCutoff.")
+        }
         $config.InstallCutoffMinutes = $maxInstallCutoff
     }
     if ($config.RebootCutoffMinutes -gt $config.InstallCutoffMinutes) {
-        $problems.Add("RebootCutoffMinutes $($config.RebootCutoffMinutes) is larger than InstallCutoffMinutes $($config.InstallCutoffMinutes), so a pass could finish with no time left to restart; using $($config.InstallCutoffMinutes).")
+        if ($supplied.Contains('RebootCutoffMinutes')) {
+            $problems.Add("RebootCutoffMinutes $($config.RebootCutoffMinutes) is larger than InstallCutoffMinutes $($config.InstallCutoffMinutes), so a pass could finish with no time left to restart; using $($config.InstallCutoffMinutes).")
+        }
         $config.RebootCutoffMinutes = $config.InstallCutoffMinutes
+    }
+    if (-not $supplied.Contains('StartDelayMinutes')) {
+        # The default hands the first part of the window to Windows Update: 120 min of the
+        # 8-hour default window, scaled down to a quarter of a shorter one.
+        $config.StartDelayMinutes = [int][math]::Min($config.StartDelayMinutes, [math]::Floor($length / 4))
     }
     $maxStartDelay = $length - $config.InstallCutoffMinutes - 1
     if ($config.StartDelayMinutes -gt $maxStartDelay) {
-        $problems.Add("StartDelayMinutes $($config.StartDelayMinutes) starts after the install cutoff; using $maxStartDelay.")
-        $config.StartDelayMinutes = $maxStartDelay
+        if ($supplied.Contains('StartDelayMinutes')) {
+            $problems.Add("StartDelayMinutes $($config.StartDelayMinutes) starts after the install cutoff; using $maxStartDelay.")
+        }
+        $config.StartDelayMinutes = [math]::Max(0, $maxStartDelay)
     }
 
     return @{ Config = $config; Problems = $problems.ToArray() }
@@ -586,13 +616,18 @@ function Get-DcuWindowState {
     if ($crossesMidnight) { $closes = $closes.AddDays(1) }
 
     $minutesLeft = $null
-    if ($inWindow) { $minutesLeft = [int][math]::Floor(($closes - $Now).TotalMinutes) }
+    $minutesOpen = $null
+    if ($inWindow) {
+        $minutesLeft = [int][math]::Floor(($closes - $Now).TotalMinutes)
+        $minutesOpen = [int][math]::Floor(($Now - $opens).TotalMinutes)
+    }
 
     return [pscustomobject]@{
         NightId           = $nightDate.ToString('yyyy-MM-dd')
         InWindow          = $inWindow
         Opens             = $opens.ToString('yyyy-MM-ddTHH:mm')
         Closes            = $closes.ToString('yyyy-MM-ddTHH:mm')
+        MinutesSinceOpen  = $minutesOpen
         MinutesUntilClose = $minutesLeft
         CanStartInstall   = [bool]($inWindow -and $minutesLeft -gt $Config.InstallCutoffMinutes)
         CanReboot         = [bool]($inWindow -and $minutesLeft -gt $Config.RebootCutoffMinutes)
@@ -614,7 +649,9 @@ function Get-DcuSchedulePlan {
         '{0:00}:{1:00}' -f $t.Hours, $t.Minutes
     }
 
-    $repeatFor = $installStopsAfter - $Config.StartDelayMinutes
+    # Re-checks run until the RESTART cutoff, not the install cutoff: a restart deferred because
+    # Windows Update was still installing needs a later trigger to happen at all.
+    $repeatFor = $rebootStopsAfter - $Config.StartDelayMinutes
     $repeat = ($Config.RetryIntervalMinutes -gt 0) -and ($repeatFor -gt $Config.RetryIntervalMinutes)
 
     return [pscustomobject]@{
@@ -622,6 +659,7 @@ function Get-DcuSchedulePlan {
         FirstStartSpan     = New-TimeSpan -Minutes ((([int]$start.TotalMinutes) + $Config.StartDelayMinutes) % 1440)
         RepeatEveryMinutes = $(if ($repeat) { $Config.RetryIntervalMinutes } else { 0 })
         RepeatForMinutes   = $(if ($repeat) { $repeatFor } else { 0 })
+        RepeatUntil        = (& $format $rebootStopsAfter)
         InstallCutoff      = (& $format $installStopsAfter)
         RebootCutoff       = (& $format $rebootStopsAfter)
         WindowMinutes      = $length
@@ -926,11 +964,23 @@ function Get-DcuFreezeState {
     return [pscustomobject]$result
 }
 
+function Test-DcuMayInstall {
+    # Installing is only worth doing when it will be kept.
+    param([Parameter(Mandatory)] $Freeze, [Parameter(Mandatory)] $Config)
+    return ($Freeze.State -eq 'Thawed') -or ($Freeze.State -eq 'NotInstalled' -and $Config.RunWithoutDeepFreeze)
+}
+
+function Get-DcuFreezeOutcome {
+    param([Parameter(Mandatory)] $Freeze)
+    if ($Freeze.State -eq 'Frozen') { return 'SkippedFrozen' }
+    return 'SkippedFreezeStateUnknown'
+}
+
 function Get-DcuFreezeRefusal {
     param([Parameter(Mandatory)] $Freeze, [Parameter(Mandatory)] $Config)
     switch ($Freeze.State) {
         'Frozen' {
-            return "Machine is FROZEN, so nothing was run: anything DCU installed now would be discarded at the next restart. If this repeats every night, the Deep Freeze Thawed Period is not covering $($Config.WindowStart)-$($Config.WindowEnd)."
+            return "Machine is FROZEN, so nothing was run: anything DCU installed now would be discarded at the next restart. If this repeats every night, Deep Freeze is not being disabled or thawed for $($Config.WindowStart)-$($Config.WindowEnd): check the policy's Maintenance Period (Deep Freeze among the disabled services) or Thawed Period."
         }
         'NotInstalled' {
             return 'Deep Freeze was not detected (no DFServ service, no DFC.exe), so the freeze state cannot be confirmed and nothing was run. If these machines are not protected, install with -RunWithoutDeepFreeze.'
@@ -1335,16 +1385,19 @@ function Test-DcuServicingBusy {
 }
 
 function Wait-DcuServicingIdle {
+    # Counts the time actually waited rather than comparing against a wall-clock deadline, so a
+    # clock change (time sync, DST) cannot stretch or cut short the wait.
     param([Parameter(Mandatory)] [int] $MaxMinutes)
-    $deadline = (Get-Date).AddMinutes($MaxMinutes)
+    $limit = $MaxMinutes * 60
+    $step = [math]::Max(1, $script:DcuServicingPollSeconds)
     $waited = 0
     while ($true) {
         $reasons = @(Test-DcuServicingBusy)
         if ($reasons.Count -eq 0) { return [pscustomobject]@{ Idle = $true; WaitedSeconds = $waited; Reasons = @() } }
-        if ((Get-Date) -ge $deadline) { return [pscustomobject]@{ Idle = $false; WaitedSeconds = $waited; Reasons = $reasons } }
+        if ($waited -ge $limit) { return [pscustomobject]@{ Idle = $false; WaitedSeconds = $waited; Reasons = $reasons } }
         if ($waited -eq 0) { Write-DcuLog -Message "Waiting up to $MaxMinutes min: $($reasons -join '; ')." }
         Start-Sleep -Seconds $script:DcuServicingPollSeconds
-        $waited += $script:DcuServicingPollSeconds
+        $waited += $step
     }
 }
 
@@ -1398,6 +1451,8 @@ function New-DcuNightState {
         InterruptedPasses = 0
         LastOutcome       = $null
         AppliedTonight    = @()     # "name version" of each update DCU reported applying tonight
+        RebootPending     = $false  # DCU needs a restart that was deferred (an install was running)
+        RebootPendingBoot = $null   # boot time when it was deferred; a later boot means it happened
         UpdatedAt         = $null
     }
 }
@@ -1436,7 +1491,20 @@ function Read-DcuNightState {
     # Assign first, then pipe: Get-DcuValue returns arrays intact, so @(Get-DcuValue ...) would nest.
     $applied = Get-DcuValue $raw 'AppliedTonight'
     $fresh.AppliedTonight = @(@($applied) | Where-Object { $_ -is [string] -and $_.Length -le 200 } | Select-Object -First 50)
+    $fresh.RebootPending = ((Get-DcuValue $raw 'RebootPending') -is [bool]) -and (Get-DcuValue $raw 'RebootPending')
+    $boot = [string](Get-DcuValue $raw 'RebootPendingBoot')
+    if ($boot -match '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$') { $fresh.RebootPendingBoot = $boot }
     return $fresh
+}
+
+function Get-DcuBootTime {
+    # When Windows last started, to the minute: enough to tell "it has restarted since" from "it
+    # has not". $null when unknown, which callers treat as "has not".
+    try {
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+        if ($os.LastBootUpTime) { return ([datetime]$os.LastBootUpTime).ToString('yyyy-MM-ddTHH:mm') }
+    } catch { }
+    return $null
 }
 
 function Add-DcuAppliedUpdates {
@@ -1664,8 +1732,13 @@ function Complete-DcuFailure {
 }
 
 function Invoke-DcuRebootStep {
-    # DCU wants a restart. Take it inside the window while still Thawed, so whatever finishes during
-    # the restart is kept; past the reboot cutoff, record that the work is left pending instead.
+    <#
+        DCU wants a restart. Take it inside the window while still Thawed, so whatever finishes
+        during the restart is kept -- but never on top of a running install. Software Updater may
+        be installing Windows Updates in the same window, and a restart in the middle of that is
+        worse than a late one. A busy machine defers the restart to the next trigger instead.
+        Past the restart cutoff, record that the work is left pending.
+    #>
     param(
         [Parameter(Mandatory)] $Run,
         [Parameter(Mandatory)] $Night,
@@ -1676,19 +1749,39 @@ function Invoke-DcuRebootStep {
         [switch] $IgnoreWindow
     )
     $common = @{ Run = $Run; Night = $Night; StateFile = $StateFile; StateDir = $StateDir }
+    $tooLate = {
+        param($window)
+        $Night.RebootPending = $false
+        return Complete-DcuNight @common -Outcome 'RebootPendingAtWindowEnd' -ExitCode 7 -Severity 'Warning' -Final `
+            -Message "DCU needs a restart ($Reason) but only $($window.MinutesUntilClose) min of the window remain (restart cutoff $($Config.RebootCutoffMinutes) min). It will finish on a later night."
+    }
+
     if ($Config.NoReboot) {
+        $Night.RebootPending = $false
         return Complete-DcuNight @common -Outcome 'RebootRequiredNoReboot' -ExitCode 7 -Severity 'Warning' -Final `
             -Message "DCU needs a restart ($Reason) and NoReboot is set. The next restart will be Deep Freeze's Frozen one, which discards the work that finishes during a restart."
     }
     $window = Get-DcuWindowState -Now (Get-DcuNow) -Config $Config
-    if (-not $IgnoreWindow -and -not $window.CanReboot) {
-        return Complete-DcuNight @common -Outcome 'RebootPendingAtWindowEnd' -ExitCode 7 -Severity 'Warning' -Final `
-            -Message "DCU needs a restart ($Reason) but only $($window.MinutesUntilClose) min of the window remain (restart cutoff $($Config.RebootCutoffMinutes) min). It will finish on a later Thawed night."
+    if (-not $IgnoreWindow -and -not $window.CanReboot) { return (& $tooLate $window) }
+
+    $idle = Wait-DcuServicingIdle -MaxMinutes $Config.ServicingWaitMinutes
+    if (-not $idle.Idle) {
+        $Night.RebootPending = $true
+        $Night.RebootPendingBoot = Get-DcuBootTime
+        return Complete-DcuNight @common -Outcome 'RebootDeferredBusy' -ExitCode 3 -Severity 'Warning' `
+            -Message "DCU needs a restart ($Reason), but after $($Config.ServicingWaitMinutes) min the machine is still busy ($($idle.Reasons -join '; ')) -- most likely Software Updater or Windows Update. Not restarting on top of it: the next trigger restarts once it is idle, or carries on if it has restarted by then."
+    }
+    if ($idle.WaitedSeconds -gt 0) {
+        # Time passed while waiting, so the restart cutoff may have, too.
+        $window = Get-DcuWindowState -Now (Get-DcuNow) -Config $Config
+        if (-not $IgnoreWindow -and -not $window.CanReboot) { return (& $tooLate $window) }
     }
 
     # Record everything BEFORE asking for the restart. With a short RebootDelaySeconds, Windows can
     # end this process before another line runs, and the night's result would be lost.
     $Night.InProgress = $false
+    $Night.RebootPending = $false
+    $Night.RebootPendingBoot = $null
     $Night.LastOutcome = 'RebootScheduled'
     [void](Save-DcuNightState -Path $StateFile -State $Night)
     $next = 'A final scan runs after it.'
@@ -1727,9 +1820,6 @@ function Invoke-DcuRunCore {
     $stateDir = $StateInfo.Path
     $run = New-DcuRunRecord -Config $Config -StateInfo $StateInfo -DryRun ([bool]$DryRun)
     foreach ($problem in @($ConfigProblems)) { if ($problem) { Write-DcuLog -Level Warning -Message "Config: $problem" } }
-    if (-not $StateInfo.IsPersistent) {
-        Write-DcuLog -Level Warning -Message "State directory '$stateDir' is on the system volume: logs written while Frozen are lost at restart. Pass -StatePath pointing at a ThawSpace."
-    }
 
     # --- 1. Window --------------------------------------------------------------------------------
     $now = Get-DcuNow
@@ -1744,6 +1834,7 @@ function Invoke-DcuRunCore {
         Start             = $Config.WindowStart
         End               = $Config.WindowEnd
         InWindow          = $window.InWindow
+        MinutesSinceOpen  = $window.MinutesSinceOpen
         MinutesUntilClose = $window.MinutesUntilClose
         CanStartInstall   = $window.CanStartInstall
         CanReboot         = $window.CanReboot
@@ -1755,48 +1846,82 @@ function Invoke-DcuRunCore {
     } elseif (-not $window.InWindow) {
         return Complete-DcuRun -Run $run -StateDir $stateDir -Outcome 'OutsideWindow' -ExitCode 1 -Severity 'Info' -NoOp `
             -Message "Outside the maintenance window ($($Config.WindowStart)-$($Config.WindowEnd)); nothing to do."
-    } elseif (-not $window.CanStartInstall) {
-        return Complete-DcuRun -Run $run -StateDir $stateDir -Outcome 'PastInstallCutoff' -ExitCode 1 -Severity 'Info' -NoOp `
-            -Message "$($window.MinutesUntilClose) min of the window remain; no new pass starts within $($Config.InstallCutoffMinutes) min of the end."
     }
 
     # --- 2. Tonight's pass state ------------------------------------------------------------------
     $stateFile = Join-Path $stateDir 'dcu-state.json'
     $night = Read-DcuNightState -Path $stateFile -NightId $nightId
-    $verifyOnly = $false
     if (-not $DryRun) {
         if ($night.InProgress) {
             $night.InProgress = $false
             $night.InterruptedPasses++
-            Write-DcuLog -Level Warning -Message "Pass $($night.Passes) never recorded a result: it was interrupted (DCU restarting for a BIOS update, the task time limit, a power loss, or a Deep Freeze restart)."
+            Write-DcuLog -Level Warning -Message "Pass $($night.Passes) never recorded a result: it was interrupted (a restart by Software Updater or Windows Update, DCU restarting for a BIOS update, the task time limit, a power loss, or Deep Freeze)."
             [void](Save-DcuNightState -Path $stateFile -State $night)
         }
         if ($night.Completed) {
             return Complete-DcuRun -Run $run -StateDir $stateDir -Outcome 'AlreadyCompleted' -ExitCode 0 -Severity 'Info' -NoOp `
                 -Message "Already finished for the night of $nightId ($($night.LastOutcome))."
         }
-        if ($night.Passes -ge $Config.MaxPassesPerNight) {
-            $verifyOnly = $true
-            Write-DcuLog -Message "All $($Config.MaxPassesPerNight) passes used tonight; running one final scan to report what is left."
-        }
     }
     $run.Pass = $night.Passes
     $run.AppliedTonight = @($night.AppliedTonight)
 
+    # --- 2b. A restart deferred earlier tonight, because an install was running -------------------
+    # Handled before the install cutoff on purpose: the restart may still happen after it.
+    if (-not $DryRun -and $night.RebootPending) {
+        $bootNow = Get-DcuBootTime
+        if ($bootNow -and $night.RebootPendingBoot -and $bootNow -ne $night.RebootPendingBoot) {
+            Write-DcuLog -Message "The machine has restarted since DCU asked for a restart (booted $bootNow); carrying on with the next pass."
+            $night.RebootPending = $false
+            $night.RebootPendingBoot = $null
+            [void](Save-DcuNightState -Path $stateFile -State $night)
+        } else {
+            $freeze = Get-DcuFreezeState -DfcPath $Config.DFCPath
+            $run.FreezeState = $freeze.State
+            $run.FreezeDetail = $freeze.Detail
+            if (-not (Test-DcuMayInstall -Freeze $freeze -Config $Config)) {
+                return Complete-DcuRun -Run $run -StateDir $stateDir -Outcome (Get-DcuFreezeOutcome -Freeze $freeze) -ExitCode 2 `
+                    -Severity 'Warning' -Message (Get-DcuFreezeRefusal -Freeze $freeze -Config $Config)
+            }
+            $pending = @{ Run = $run; Night = $night; StateFile = $stateFile; StateDir = $stateDir }
+            return Invoke-DcuRebootStep @pending -Config $Config -Reason 'needed since earlier tonight' -IgnoreWindow:$IgnoreWindow
+        }
+    }
+
+    # --- 2c. Is it time to START a pass? -----------------------------------------------------------
+    if (-not $IgnoreWindow) {
+        if (-not $window.CanStartInstall) {
+            return Complete-DcuRun -Run $run -StateDir $stateDir -Outcome 'PastInstallCutoff' -ExitCode 1 -Severity 'Info' -NoOp `
+                -Message "$($window.MinutesUntilClose) min of the window remain; no new pass starts within $($Config.InstallCutoffMinutes) min of the end."
+        }
+        if ($night.Passes -eq 0 -and $window.MinutesSinceOpen -lt $Config.StartDelayMinutes) {
+            # Typically the at-startup trigger after the maintenance restart at the window's start.
+            return Complete-DcuRun -Run $run -StateDir $stateDir -Outcome 'BeforeStartDelay' -ExitCode 1 -Severity 'Info' -NoOp `
+                -Message "Tonight's first pass starts at $((Get-DcuSchedulePlan -Config $Config).FirstStart) (WindowStart + $($Config.StartDelayMinutes) min), so Windows Update has the start of the window."
+        }
+    }
+    $verifyOnly = $false
+    if (-not $DryRun -and $night.Passes -ge $Config.MaxPassesPerNight) {
+        $verifyOnly = $true
+        Write-DcuLog -Message "All $($Config.MaxPassesPerNight) passes used tonight; running one final scan to report what is left."
+    }
+
     # --- 3. Freeze state --------------------------------------------------------------------------
+    if (-not $StateInfo.IsPersistent) {
+        # Logged here, past the no-op gates, so the hourly re-checks do not repeat it all night.
+        Write-DcuLog -Message "State directory '$stateDir' is on the system volume: what is written while Deep Freeze is thawed or disabled is kept, but anything written while Frozen is lost at restart. A ThawSpace (-StatePath) keeps both."
+    }
     $freeze = Get-DcuFreezeState -DfcPath $Config.DFCPath
     $run.FreezeState = $freeze.State
     $run.FreezeDetail = $freeze.Detail
     Write-DcuLog -Message "Deep Freeze state: $($freeze.State) via $($freeze.Method)"
-    $mayRun = ($freeze.State -eq 'Thawed') -or ($freeze.State -eq 'NotInstalled' -and $Config.RunWithoutDeepFreeze)
+    $mayRun = Test-DcuMayInstall -Freeze $freeze -Config $Config
     if (-not $mayRun) {
         if ($DryRun) {
             Write-DcuLog -Level Warning -Message "Machine is $($freeze.State). A real run would stop here; -DryRun continues because it installs nothing."
         } else {
-            $outcome = 'SkippedFreezeStateUnknown'
-            if ($freeze.State -eq 'Frozen') { $outcome = 'SkippedFrozen' }
-            return Complete-DcuRun -Run $run -StateDir $stateDir -Outcome $outcome -ExitCode 2 -Severity 'Warning' `
-                -Message (Get-DcuFreezeRefusal -Freeze $freeze -Config $Config)
+            return Complete-DcuRun -Run $run -StateDir $stateDir -Outcome (Get-DcuFreezeOutcome -Freeze $freeze) -ExitCode 2 `
+                -Severity 'Warning' -Message (Get-DcuFreezeRefusal -Freeze $freeze -Config $Config)
         }
     }
 
@@ -2040,7 +2165,7 @@ function Register-DcuTask {
     return [pscustomobject]@{
         Name     = $script:DcuTaskName
         Triggers = @($registered.Triggers).Count
-        Plan     = ($plan | Select-Object FirstStart, RepeatEveryMinutes, RepeatForMinutes, InstallCutoff, RebootCutoff, WindowMinutes)
+        Plan     = ($plan | Select-Object FirstStart, RepeatEveryMinutes, RepeatForMinutes, RepeatUntil, InstallCutoff, RebootCutoff, WindowMinutes)
         Limit    = $limit.ToString()
     }
 }
@@ -2098,7 +2223,7 @@ function Install-DcuMaintenance {
     Write-DcuLog -Message "State directory: $($state.Path) [$($state.Source)]"
     if ($state.Warning) { Write-DcuLog -Level Warning -Message $state.Warning }
     if (-not $state.IsPersistent) {
-        Write-DcuLog -Level Warning -Message "'$($state.Path)' is on the system volume, so logs written while Frozen are lost at restart. A ThawSpace (and -StatePath) is strongly recommended."
+        Write-DcuLog -Level Warning -Message "'$($state.Path)' is on the system volume. Results written during the maintenance window are kept (Deep Freeze is thawed or disabled then), but anything written while Frozen is lost at restart. A ThawSpace (-StatePath) keeps both."
     }
 
     $freeze = Get-DcuFreezeState -DfcPath $config.DFCPath
@@ -2109,7 +2234,7 @@ function Install-DcuMaintenance {
             Write-DcuLog -Level Warning -Message "Machine is $($freeze.State); continuing because of -SkipFreezeCheck. If it is Frozen, all of this is discarded at the next restart."
         } else {
             $why = switch ($freeze.State) {
-                'Frozen' { 'This machine is FROZEN. A scheduled task created now would be discarded at the next restart, so nothing was installed. Push again while it is Thawed: during the Thawed Period, or after a Reboot Thawed from the console.' }
+                'Frozen' { 'This machine is FROZEN. A scheduled task created now would be discarded at the next restart, so nothing was installed. Push again while Deep Freeze is disabled or thawed: during the nightly Maintenance Period, after the Live Action "Run Maintenance Period", or after "Reboot Thawed".' }
                 'NotInstalled' { 'Deep Freeze was not detected. If these machines really are unprotected, push again with -RunWithoutDeepFreeze.' }
                 default { "Could not confirm the machine is Thawed ($($freeze.Detail)). Nothing was installed. Pass -DFCPath if DFC.exe is somewhere unusual, or -SkipFreezeCheck if you are sure it is Thawed." }
             }
@@ -2187,7 +2312,7 @@ function Install-DcuMaintenance {
 
     $plan = $task.Plan
     $repeat = 'no repeats'
-    if ($plan.RepeatEveryMinutes -gt 0) { $repeat = "repeating every $($plan.RepeatEveryMinutes) min until $($plan.InstallCutoff)" }
+    if ($plan.RepeatEveryMinutes -gt 0) { $repeat = "repeating every $($plan.RepeatEveryMinutes) min until $($plan.RepeatUntil)" }
     $persistence = 'NOT persistent -- lost at each Frozen restart'
     if ($state.IsPersistent) { $persistence = 'persistent' }
     $lines = @(

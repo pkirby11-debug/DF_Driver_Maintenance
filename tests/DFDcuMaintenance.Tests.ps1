@@ -67,7 +67,9 @@ BeforeAll {
 
     function script:New-TestConfig {
         param([hashtable] $Overrides = @{})
-        $raw = @{ RandomDelayMinutes = 0 }
+        # No jitter and no start delay, so orchestration tests are not tied to the clock; the
+        # start-delay gate has its own tests.
+        $raw = @{ RandomDelayMinutes = 0; StartDelayMinutes = 0 }
         foreach ($k in $Overrides.Keys) { $raw[$k] = $Overrides[$k] }
         $built = ConvertTo-DcuConfig -Raw $raw
         if (@($built.Problems).Count) { throw "Test config problems: $($built.Problems -join ' | ')" }
@@ -265,6 +267,26 @@ Describe 'ConvertTo-DcuConfig' {
         $built.Config.WindowEnd | Should -Be '06:00'
     }
 
+    It 'scales the default start delay to a quarter of a short window, silently' {
+        $built = ConvertTo-DcuConfig -Raw @{ WindowStart = '02:00'; WindowEnd = '06:00' }
+        @($built.Problems).Count | Should -Be 0
+        $built.Config.StartDelayMinutes | Should -Be 60
+        (ConvertTo-DcuConfig -Raw @{}).Config.StartDelayMinutes | Should -Be 120
+    }
+
+    It 'adjusts defaults that do not fit a short window without blocking the install' {
+        $built = ConvertTo-DcuConfig -Raw @{ WindowStart = '05:00'; WindowEnd = '06:00' }
+        @($built.Problems).Count | Should -Be 0
+        $built.Config.InstallCutoffMinutes | Should -Be 30
+        $built.Config.StartDelayMinutes | Should -Be 15
+    }
+
+    It 'still rejects a start delay the admin set that lands after the install cutoff' {
+        $built = ConvertTo-DcuConfig -Raw @{ WindowStart = '02:00'; WindowEnd = '06:00'; StartDelayMinutes = 200 }
+        @($built.Problems).Count | Should -Be 1
+        $built.Config.StartDelayMinutes | Should -Be 149
+    }
+
     It 'clamps cutoffs that would leave no time to work' {
         $built = ConvertTo-DcuConfig -Raw @{ WindowStart = '02:00'; WindowEnd = '04:00'; InstallCutoffMinutes = 200; RebootCutoffMinutes = 500 }
         $built.Config.InstallCutoffMinutes | Should -Be 90      # 120-min window - 30
@@ -384,10 +406,11 @@ Describe 'Get-DcuWindowState (22:00-06:00, cutoffs 90/30)' {
 # =================================================================================================
 Describe 'Get-DcuSchedulePlan' {
     It 'derives the default triggers from the window' {
-        $plan = Get-DcuSchedulePlan -Config (New-TestConfig)
-        $plan.FirstStart | Should -Be '22:10'
+        $plan = Get-DcuSchedulePlan -Config (ConvertTo-DcuConfig -Raw @{}).Config
+        $plan.FirstStart | Should -Be '00:00'        # 22:00 + 120: Windows Update gets the start
         $plan.RepeatEveryMinutes | Should -Be 60
-        $plan.RepeatForMinutes | Should -Be 380   # 22:10 -> 04:30
+        $plan.RepeatForMinutes | Should -Be 330      # 00:00 -> 05:30, the RESTART cutoff
+        $plan.RepeatUntil | Should -Be '05:30'
         $plan.InstallCutoff | Should -Be '04:30'
         $plan.RebootCutoff | Should -Be '05:30'
         $plan.WindowMinutes | Should -Be 480
@@ -642,6 +665,16 @@ Describe 'List-returning helpers stay flat under @()' {
         $idle.WaitedSeconds | Should -Be 0
     }
 
+    It 'Wait-DcuServicingIdle gives up after MaxMinutes of busy, whatever the clock says' {
+        Mock Write-Host { }
+        Mock Test-DcuServicingBusy { @('Windows servicing (TiWorker.exe) is running') }
+        Mock Get-Date { [datetime]'2026-11-20T00:00:00' }   # a frozen clock must not make it wait forever
+        $busy = Wait-DcuServicingIdle -MaxMinutes 1
+        $busy.Idle | Should -BeFalse
+        $busy.WaitedSeconds | Should -Be 60
+        $busy.Reasons | Should -Be @('Windows servicing (TiWorker.exe) is running')
+    }
+
     It 'Get-DcuPendingReboot is empty when nothing is pending (unmocked)' -Skip:(-not $CanFakeExe) {
         # Off Windows there is no HKLM: drive, so this checks the empty case cleanly.
         @(Get-DcuPendingReboot).Count | Should -Be 0
@@ -715,6 +748,21 @@ Describe 'Night state (the pass counter)' {
         $path = Join-Path (New-TestDir 'ns') 'dcu-state.json'
         [System.IO.File]::WriteAllText($path, $Json)
         (Read-DcuNightState -Path $path -NightId '2026-11-19').Passes | Should -Be 0
+    }
+
+    It 'round-trips a deferred restart, and ignores a malformed boot time' {
+        $path = Join-Path (New-TestDir 'ns') 'dcu-state.json'
+        $state = New-DcuNightState -NightId '2026-11-19'
+        $state.RebootPending = $true; $state.RebootPendingBoot = '2026-11-19T22:02'
+        [void](Save-DcuNightState -Path $path -State $state)
+        $read = Read-DcuNightState -Path $path -NightId '2026-11-19'
+        $read.RebootPending | Should -BeTrue
+        $read.RebootPendingBoot | Should -Be '2026-11-19T22:02'
+
+        [System.IO.File]::WriteAllText($path, '{"NightId":"2026-11-19","Passes":1,"RebootPending":"yes","RebootPendingBoot":"; rm -rf /"}')
+        $bad = Read-DcuNightState -Path $path -NightId '2026-11-19'
+        $bad.RebootPending | Should -BeFalse
+        $bad.RebootPendingBoot | Should -BeNullOrEmpty
     }
 
     It 'keeps only short strings in AppliedTonight' {
@@ -825,8 +873,17 @@ Describe 'Invoke-DcuRunCore (orchestration)' {
         Mock Get-DcuServiceState { $script:FakeService }
         Mock Start-DcuService { $true }
         Mock Get-DcuFreeSpaceGB { $script:FakeFreeGB }
-        Mock Wait-DcuServicingIdle { $script:FakeIdle }
+        Mock Wait-DcuServicingIdle {
+            # Queued answers first (the pre-install and pre-restart checks can differ), then the default.
+            if ($script:IdleQueue.Count -gt 0) {
+                $item = $script:IdleQueue.Dequeue()
+                if ($item -is [scriptblock]) { return (& $item) }
+                return $item
+            }
+            $script:FakeIdle
+        }
         Mock Get-DcuPendingReboot { @() }
+        Mock Get-DcuBootTime { $script:FakeBoot }
         Mock Invoke-DcuReboot {
             $script:RebootCalls++
             # What a collector would see if the machine went down this instant.
@@ -857,6 +914,8 @@ Describe 'Invoke-DcuRunCore (orchestration)' {
             $script:FakeService = [pscustomobject]@{ Installed = $true; Status = 'Running'; StartType = 'Automatic' }
             $script:FakeFreeGB = 50
             $script:FakeIdle = [pscustomobject]@{ Idle = $true; WaitedSeconds = 0; Reasons = @() }
+            $script:IdleQueue = New-Object 'System.Collections.Generic.Queue[object]'
+            $script:FakeBoot = '2026-11-19T22:02'
             $script:FakeRebootResult = [pscustomobject]@{ Scheduled = $true; ExitCode = 0; Detail = 'ok' }
             $script:RebootCalls = 0
             $script:DcuCalls = New-Object System.Collections.Generic.List[object]
@@ -1098,6 +1157,113 @@ Describe 'Invoke-DcuRunCore (orchestration)' {
             $after = Get-NightState
             $after.InterruptedPasses | Should -Be 1
             $after.Passes | Should -Be 2
+        }
+    }
+
+    Context 'sharing the window with Software Updater / Windows Update' {
+        It 'leaves the start of the window to Windows Update: no first pass before WindowStart + StartDelayMinutes' {
+            $script:FakeNow = [datetime]'2026-11-19T22:30:00'   # e.g. the at-startup trigger after the maintenance restart
+            Invoke-TestRun -Overrides @{ StartDelayMinutes = 120 } | Should -Be 1
+            $script:DcuCalls.Count | Should -Be 0
+            Test-Path (Join-Path $script:StateDir 'dcu-status.json') | Should -BeFalse
+
+            $script:FakeNow = [datetime]'2026-11-20T00:05:00'
+            Invoke-TestRun -Overrides @{ StartDelayMinutes = 120 } | Should -Be 0
+            $script:DcuCalls.Count | Should -BeGreaterThan 0
+        }
+
+        It 'does not hold back the passes after the first one' {
+            $night = New-DcuNightState -NightId '2026-11-19'
+            $night.Passes = 1
+            [void](Save-DcuNightState -Path (Join-Path $script:StateDir 'dcu-state.json') -State $night)
+            $script:FakeNow = [datetime]'2026-11-19T22:30:00'
+            Invoke-TestRun -Overrides @{ StartDelayMinutes = 120 } | Should -Be 0
+            $script:DcuCalls.Count | Should -BeGreaterThan 0
+        }
+
+        It 'defers a restart while an install is running, then restarts at the next trigger without another pass' {
+            Enqueue scan 0
+            Enqueue applyUpdates 1
+            $script:IdleQueue.Enqueue($script:FakeIdle)                                                      # before the pass: idle
+            $script:IdleQueue.Enqueue([pscustomobject]@{ Idle = $false; WaitedSeconds = 1800; Reasons = @('Windows servicing (TiWorker.exe) is running') })  # before the restart: busy
+            Invoke-TestRun | Should -Be 3
+            (Get-Status).Outcome | Should -Be 'RebootDeferredBusy'
+            $script:RebootCalls | Should -Be 0
+            $night = Get-NightState
+            $night.RebootPending | Should -BeTrue
+            $night.RebootPendingBoot | Should -Be '2026-11-19T22:02'
+
+            $calls = $script:DcuCalls.Count
+            $script:FakeNow = [datetime]'2026-11-20T00:00:00'                                                # next hourly trigger, same boot
+            Invoke-TestRun | Should -Be 3010
+            $script:RebootCalls | Should -Be 1
+            $script:DcuCalls.Count | Should -Be $calls -Because 'a deferred restart is finished without running DCU again'
+            $after = Get-NightState
+            $after.Passes | Should -Be 1
+            $after.RebootPending | Should -BeFalse
+        }
+
+        It 'skips the deferred restart if the machine has restarted since (e.g. Software Updater did it)' {
+            Enqueue scan 0, 500
+            Enqueue applyUpdates 1
+            $script:IdleQueue.Enqueue($script:FakeIdle)
+            $script:IdleQueue.Enqueue([pscustomobject]@{ Idle = $false; WaitedSeconds = 1800; Reasons = @('busy') })
+            Invoke-TestRun | Should -Be 3
+
+            $script:FakeBoot = '2026-11-19T23:41'                                                            # a new boot
+            $script:FakeNow = [datetime]'2026-11-20T00:00:00'
+            Invoke-TestRun | Should -Be 0
+            (Get-Status).Outcome | Should -Be 'UpToDate'
+            $script:RebootCalls | Should -Be 0
+            (Get-NightState).Passes | Should -Be 2
+        }
+
+        It 'still takes a deferred restart after the install cutoff, as long as it is before the restart cutoff' {
+            $script:FakeNow = [datetime]'2026-11-20T04:15:00'
+            Enqueue scan 0
+            Enqueue applyUpdates 1
+            $script:IdleQueue.Enqueue($script:FakeIdle)
+            $script:IdleQueue.Enqueue([pscustomobject]@{ Idle = $false; WaitedSeconds = 1800; Reasons = @('busy') })
+            Invoke-TestRun | Should -Be 3
+
+            $script:FakeNow = [datetime]'2026-11-20T04:50:00'                                                # past 04:30, before 05:30
+            Invoke-TestRun | Should -Be 3010
+            $script:RebootCalls | Should -Be 1
+        }
+
+        It 'gives up on a deferred restart at the restart cutoff' {
+            $script:FakeNow = [datetime]'2026-11-20T04:15:00'
+            Enqueue scan 0
+            Enqueue applyUpdates 1
+            $script:IdleQueue.Enqueue($script:FakeIdle)
+            $script:IdleQueue.Enqueue([pscustomobject]@{ Idle = $false; WaitedSeconds = 1800; Reasons = @('busy') })
+            [void](Invoke-TestRun)
+
+            $script:FakeNow = [datetime]'2026-11-20T05:40:00'
+            Invoke-TestRun | Should -Be 7
+            (Get-Status).Outcome | Should -Be 'RebootPendingAtWindowEnd'
+            (Get-NightState).Completed | Should -BeTrue
+            $script:RebootCalls | Should -Be 0
+        }
+
+        It 're-checks the restart cutoff when waiting for an install used up the time' {
+            $script:FakeNow = [datetime]'2026-11-20T05:00:00'
+            $night = New-DcuNightState -NightId '2026-11-19'
+            $night.Passes = 1; $night.RebootPending = $true; $night.RebootPendingBoot = '2026-11-19T22:02'
+            [void](Save-DcuNightState -Path (Join-Path $script:StateDir 'dcu-state.json') -State $night)
+            # The wait ends idle, but 35 minutes later -- past the 05:30 restart cutoff.
+            $script:IdleQueue.Enqueue({ $script:FakeNow = [datetime]'2026-11-20T05:35:00'; [pscustomobject]@{ Idle = $true; WaitedSeconds = 2100; Reasons = @() } })
+            Invoke-TestRun | Should -Be 7
+            $script:RebootCalls | Should -Be 0
+        }
+
+        It 'will not take a deferred restart on a Frozen machine' {
+            $night = New-DcuNightState -NightId '2026-11-19'
+            $night.Passes = 1; $night.RebootPending = $true; $night.RebootPendingBoot = '2026-11-19T22:02'
+            [void](Save-DcuNightState -Path (Join-Path $script:StateDir 'dcu-state.json') -State $night)
+            $script:FakeFreeze = 'Frozen'
+            Invoke-TestRun | Should -Be 2
+            $script:RebootCalls | Should -Be 0
         }
     }
 
