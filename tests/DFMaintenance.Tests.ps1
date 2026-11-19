@@ -93,7 +93,9 @@ Describe 'Write-DFLog' {
     It 'includes structured data when supplied' {
         $log = Join-Path $script:TestRoot 'data.jsonl'
         Write-DFLog -Message 'with data' -LogPath $log -Data @{ Pending = 7 }
-        ((Get-Content -LiteralPath $log)[0] | ConvertFrom-Json).Data.Pending | Should -Be 7
+        # @() matters: a one-line file comes back as a bare string, and [0] would be its first
+        # CHARACTER ('{'), not its first line.
+        (@(Get-Content -LiteralPath $log)[0] | ConvertFrom-Json).Data.Pending | Should -Be 7
     }
 }
 

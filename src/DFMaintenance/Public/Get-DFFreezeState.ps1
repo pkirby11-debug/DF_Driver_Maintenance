@@ -4,7 +4,15 @@ function Get-DFFreezeState {
         Reports whether Deep Freeze currently has this machine Frozen or Thawed.
 
     .DESCRIPTION
-        Primary probe is DFC.exe /ISFROZEN.
+        Primary probe is DFC.exe get /ISFROZEN.
+
+        The literal word 'get' is required. DFC's syntax is
+        "DFC <password|get> /COMMAND": state-changing commands take the Deep Freeze
+        password in that slot, read-only queries take the literal 'get'. Faronics documents
+        the query as "DFC get /ISFROZEN". An earlier version of this function omitted
+        'get', which is not a documented form -- DFC may then parse '/ISFROZEN' as the
+        password with no command, and whatever errorlevel that yields would be read as a
+        freeze state.
 
         NOTE THE INVERTED EXIT CODE: Deep Freeze returns exit code 1 when the
         machine is FROZEN and 0 when it is THAWED. That is the opposite of the
@@ -55,7 +63,7 @@ function Get-DFFreezeState {
     }
 
     $result.DeepFreezeInstalled = $true
-    $result.Method = 'DFC.exe /ISFROZEN'
+    $result.Method = 'DFC.exe get /ISFROZEN'
 
     try {
         # The exit code carries the answer, so it MUST be read even when DFC.exe
@@ -76,7 +84,7 @@ function Get-DFFreezeState {
         $previousEap = $ErrorActionPreference
         try {
             $ErrorActionPreference = 'Continue'
-            $stderrText = (& $dfc '/ISFROZEN' 2>&1 | Out-String).Trim()
+            $stderrText = (& $dfc 'get' '/ISFROZEN' 2>&1 | Out-String).Trim()
             $exitCode = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = $previousEap

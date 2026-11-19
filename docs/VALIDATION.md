@@ -1,5 +1,10 @@
 # Validation checklist
 
+This checklist covers the DFMaintenance module (compliance reporting). The Dell Command | Update
+script has its own on-device checklist in
+[DCU-MAINTENANCE.md](DCU-MAINTENANCE.md#5-validate-on-one-machine-first). It depends on the
+DFC.exe check below, so do that one first.
+
 ## What has actually been tested
 
 This module was developed in a Linux container with no Windows, no Deep Freeze,
@@ -27,7 +32,7 @@ The highest-risk unverified item is called out below.
 
 ## Verify this first: the DFC.exe exit code
 
-`Get-DFFreezeState` maps `DFC.exe /ISFROZEN` exit codes as:
+`Get-DFFreezeState` maps `DFC.exe get /ISFROZEN` exit codes as:
 
 ```
 exit code 1  ->  FROZEN
@@ -43,14 +48,31 @@ finding, or worse, reporting a genuinely Thawed public-facing machine as fine.
 Confirm it on one machine before trusting any report:
 
 ```powershell
-# With the machine FROZEN:
-& 'C:\Program Files\Faronics\Deep Freeze\DFC.exe' /ISFROZEN
+# DFC.exe location varies by Deep Freeze version and OS bitness (on 64-bit Windows it is
+# usually C:\Windows\SysWOW64\DFC.exe). Find it first:
+$dfc = @("$env:SystemRoot\SysWOW64\DFC.exe", "$env:SystemRoot\System32\DFC.exe",
+         "${env:ProgramFiles(x86)}\Faronics\Deep Freeze\DFC.exe",
+         "$env:ProgramFiles\Faronics\Deep Freeze\DFC.exe") |
+       Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+$dfc
+
+# With the machine FROZEN. Note the literal word 'get' -- the documented syntax is
+# "DFC get /ISFROZEN" ('get' sits where a password would for state-changing commands):
+& $dfc get /ISFROZEN
 Write-Host "Frozen machine returned: $LASTEXITCODE"    # expect 1
 
 # Thaw via the Cloud console, reboot, then:
-& 'C:\Program Files\Faronics\Deep Freeze\DFC.exe' /ISFROZEN
+& $dfc get /ISFROZEN
 Write-Host "Thawed machine returned: $LASTEXITCODE"    # expect 0
+
+# Also record what the old, undocumented form returns on your build, for the record:
+& $dfc /ISFROZEN
+Write-Host "Without 'get' returned: $LASTEXITCODE"
 ```
+
+If `$dfc` comes back empty, note where DFC.exe actually lives on your build. Then add it to the
+candidate list in `src/DFMaintenance/Private/Get-DFCPath.ps1`. The DCU script
+`scripts/Invoke-DFDcuMaintenance.ps1` has the same list in `Get-DcuDfcPath`.
 
 If your build returns something different, correct the `switch` block in
 `src/DFMaintenance/Public/Get-DFFreezeState.ps1`. The mapping is deliberately
@@ -176,10 +198,16 @@ The scan runs as SYSTEM and executes the `DFCPath` from a config file on the sta
 ```powershell
 Install-Module Pester -MinimumVersion 5.0 -Scope CurrentUser -Force
 Invoke-Pester .\tests\DFMaintenance.Tests.ps1 -Output Detailed
+Invoke-Pester .\tests\DFDcuMaintenance.Tests.ps1 -Output Detailed
 ```
 
 Note: `tests/DFMaintenance.Tests.ps1` uses Windows path separators and is
-intended to run on Windows.
+intended to run on Windows. Under pwsh on Linux, the four
+`Test-DFTrustedExecutablePath` tests fail only because `$env:ProgramFiles` does not exist there.
+
+`tests/DFDcuMaintenance.Tests.ps1` runs anywhere. On Linux/macOS it also exercises the real
+process handling (exit codes, argument passing, timeouts) against shell-script stand-ins for
+`DFC.exe` and `dcu-cli.exe`; those tests are skipped on Windows.
 
 ---
 

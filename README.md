@@ -60,7 +60,7 @@ they call — changes no machine state. That matters because:
 That last point is a hard design constraint, not a convenience. See
 [Security notes](#security-notes).
 
-### The one state-changing entry point
+### The module's one state-changing entry point
 
 `Initialize-DFMaintenance` is **not** read-only, and the distinction is worth stating
 plainly rather than describing the module as a whole as incapable of changing state. It:
@@ -81,6 +81,18 @@ part of the nightly job.
 the DACL, that closes a config-file-to-SYSTEM-code-execution path on a machine students
 physically use. If `DirectorySecured` comes back `$false`, secure the directory by hand
 before relying on the deployment.
+
+### Dell Command | Update in the maintenance window (state-changing, separate script)
+
+`scripts/Invoke-DFDcuMaintenance.ps1` is **not part of the module, and it is deliberately
+state-changing**. It installs BIOS, firmware and driver updates with Dell Command | Update and
+restarts machines. It does that only inside the nightly maintenance window, and only while
+`DFC.exe get /ISFROZEN` reports the machine Thawed. It takes DCU's restarts itself, inside the
+window, so the work is kept. You push it once per machine from the Deep Freeze Cloud console,
+and it installs a SYSTEM scheduled task.
+
+Setup, the Deep Freeze Cloud task layout it depends on, exit codes and an on-device checklist
+are in **[docs/DCU-MAINTENANCE.md](docs/DCU-MAINTENANCE.md)**.
 
 ---
 
@@ -110,10 +122,13 @@ but it cannot save you from it.
 # 1. Thaw the machine via the Deep Freeze Cloud console, then:
 Import-Module .\src\DFMaintenance\DFMaintenance.psd1
 
-# 2. Set up state directory, config and the daily scan task
+# 2. Set up state directory, config and the daily scan task.
+#    Schedule it AFTER the Deep Freeze maintenance window closes (06:00 here). Inside the
+#    window the machine is Thawed by design, so a scan there reports DF001 every night. After
+#    the window, it does its real job: confirming the machine actually refroze.
 Initialize-DFMaintenance -StatePath 'T:\DFMaintenance' `
                          -RegisterScheduledTask `
-                         -ScanTime '03:00' -Verbose
+                         -ScanTime '06:30' -Verbose
 
 # 3. Confirm it works before you refreeze
 .\scripts\Invoke-DFComplianceScan.ps1 -StatePath 'T:\DFMaintenance' -IncludeHtml
@@ -196,7 +211,7 @@ error surfaced anywhere.
 
 ## Security notes
 
-- **No Deep Freeze password anywhere.** `DFC.exe /ISFROZEN` is a read-only query
+- **No Deep Freeze password anywhere.** `DFC.exe get /ISFROZEN` is a read-only query
   and does not require one. Deliberately, no function in this module performs a
   state change, so no credential ever needs to be stored on a public-facing
   endpoint. Preserve this property if you extend the module — drive state changes
@@ -214,6 +229,10 @@ error surfaced anywhere.
 - **The state directory is ACL'd** to SYSTEM and Administrators at setup. It holds the
   config that steers a SYSTEM-executed path, so a user-writable state directory is a
   privilege-escalation vector, not just untidy.
+- **The DCU script runs as SYSTEM and executes `dcu-cli.exe` and `DFC.exe`.** Both must
+  resolve under Program Files or Windows (the same rule as `DFCPath`). The installed copy
+  lives in `%ProgramFiles%`, and its settings are read only from there, never from the
+  state volume. It stores no Deep Freeze password and no BIOS password.
 - Changes to public-facing hospital endpoints should go through your normal
   change-control process, even read-only ones.
 
@@ -229,12 +248,15 @@ src/DFMaintenance/
   DFMaintenance.psm1
 scripts/
   Invoke-DFComplianceScan.ps1   # Scheduled-task entry point
+  Invoke-DFDcuMaintenance.ps1   # DCU in the maintenance window; self-contained, push via DF Cloud
 config/
   dfmaintenance.example.json
 tests/
   DFMaintenance.Tests.ps1       # Pester 5
+  DFDcuMaintenance.Tests.ps1    # Pester 5+; also runs under pwsh on Linux/macOS
 docs/
   VALIDATION.md                 # On-Windows validation checklist
+  DCU-MAINTENANCE.md            # DCU setup, Deep Freeze Cloud task layout, checklist
 ```
 
 ---
@@ -247,10 +269,12 @@ docs/
 returned to Frozen after a maintenance window, with a route for the alert to
 actually reach somebody given the VLAN isolation. Needs a decision on transport.
 
-**Phase 3 — driver maintenance orchestration.** Only if Phase 1 data shows it is
-needed. Highest risk: driver installs are multi-reboot, can roll back, and on a
-frozen machine a failed driver is self-healing on reboot — which is a genuinely
-useful property to design around rather than fight.
+**Phase 3 — driver maintenance orchestration.** Highest risk: driver installs are
+multi-reboot, can roll back, and on a frozen machine a failed driver is self-healing on
+reboot — which is a genuinely useful property to design around rather than fight.
+First implementation: `scripts/Invoke-DFDcuMaintenance.ps1` (Dell Command | Update). It
+installs only while Thawed, caps the restart chain per night, and treats a pass cut short
+by a Frozen restart as harmless. Pilot it per [docs/DCU-MAINTENANCE.md](docs/DCU-MAINTENANCE.md).
 
 Phase 1 is useful on its own even if 2 and 3 are never built.
 
